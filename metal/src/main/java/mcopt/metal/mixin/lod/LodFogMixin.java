@@ -16,8 +16,9 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 /**
  * Far terrain: the fog as the game would set it for a render distance reaching the far terrain's edge. The render-distance
- * fade moves out to the reach, the fog's color mixes with the sky as at a long render distance (the game caps that at 32
- * chunks), and the sky's fog end follows. Priority 500 so this runs before Sodium's own RETURN hook, which copies the fog
+ * fade moves out to the fog's reach (Lod.fogReach: the far terrain's reach, or on a server as far as it has data), the
+ * fog's color mixes with the sky as at a long render distance (the game caps that at 32 chunks), and the sky's fog end
+ * follows. Priority 500 so this runs before Sodium's own RETURN hook, which copies the fog
  * into its chunk shader's parameters.
  */
 @Mixin(value = FogRenderer.class, priority = 500)
@@ -26,7 +27,7 @@ abstract class LodFogMixin {
 		target = "Lnet/minecraft/client/renderer/fog/FogRenderer;computeFogColor(Lnet/minecraft/client/Camera;FLnet/minecraft/client/multiplayer/ClientLevel;IFLorg/joml/Vector4f;)V"),
 		index = 3)
 	private int mcopt$lodFogColorDistance(int renderDistance) {
-		float reach = Lod.activeReach();
+		float reach = Lod.fogReach();
 		return reach > 0 ? Math.max(renderDistance, Math.min(32, (int) (reach / 16))) : renderDistance;
 	}
 
@@ -35,7 +36,7 @@ abstract class LodFogMixin {
 		CallbackInfoReturnable<FogData> cir) {
 		FogType fluid = camera.getFluidInCamera();
 		FogData fog = cir.getReturnValue();
-		float reach = Lod.activeReach();
+		float reach = Lod.fogReach();
 		if (reach > 0 && fluid == FogType.NONE) {
 			float skyFogEnd = camera.attributeProbe().getValue(EnvironmentAttributes.SKY_FOG_END_DISTANCE, deltaTracker.getGameTimeDeltaPartialTick(false));
 			fog.skyEnd = Math.max(fog.skyEnd, Math.min(reach, skyFogEnd));

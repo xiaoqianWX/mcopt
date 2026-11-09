@@ -36,7 +36,7 @@ final class Native {
 	private static final MethodHandle TEXTURE_BUFFER = fn("mc_texture_buffer", false, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT);
 	private static final MethodHandle TEXTURE_BUFFER_ALIGNMENT = fn("mc_texture_buffer_alignment", true, JAVA_LONG, JAVA_LONG, JAVA_INT);
 	private static final MethodHandle SAMPLER_NEW = fn("mc_sampler_new", false, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_FLOAT);
-	private static final MethodHandle LIBRARY_NEW = fn("mc_library_new", false, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT);
+	private static final MethodHandle LIBRARY_NEW = fn("mc_library_new", false, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_INT);
 	private static final MethodHandle PIPELINE_NEW = fn("mc_pipeline_new", false, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT);
 	private static final MethodHandle DEPTH_STATE_NEW = fn("mc_depth_state_new", false, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT);
 	private static final MethodHandle ENC_NEW = fn("mc_enc_new", false, JAVA_LONG, JAVA_LONG);
@@ -103,6 +103,9 @@ final class Native {
 	private static final MethodHandle LAYER_CONFIGURE = fn("mc_layer_configure", false, null, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT);
 	private static final MethodHandle LAYER_NEXT = fn("mc_layer_next", false, JAVA_LONG, JAVA_LONG);
 	private static final MethodHandle PRESENT = fn("mc_present", false, null, JAVA_LONG, JAVA_LONG, JAVA_LONG);
+	private static final MethodHandle PRESENT_SPLIT = fn("mc_present_split", false, null, JAVA_LONG, JAVA_LONG, JAVA_LONG);
+	private static final MethodHandle PRESENT_READY = fn("mc_present_ready", false, JAVA_INT, JAVA_LONG);
+	private static final MethodHandle PRESENT_DRAIN = fn("mc_present_drain", false, null);
 	private static final MethodHandle PACE = fn("mc_pace", false, JAVA_INT, JAVA_DOUBLE);
 	private static final MethodHandle SLEEP_PRECISE = fn("mc_sleep_precise", false, null, JAVA_LONG);
 	private static final MethodHandle PROBE = fn("mc_probe", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG,
@@ -152,7 +155,7 @@ final class Native {
 	static long textureBuffer(long ctx, long buffer, int format, long offset, long length, int texelSize) { try { return (long) TEXTURE_BUFFER.invokeExact(ctx, buffer, format, offset, length, texelSize); } catch (Throwable t) { throw rethrow(t); } }
 	static long textureBufferAlignment(long ctx, int format) { try { return (long) TEXTURE_BUFFER_ALIGNMENT.invokeExact(ctx, format); } catch (Throwable t) { throw rethrow(t); } }
 	static long samplerNew(long ctx, int u, int v, int min, int mag, int mip, int aniso, float maxLod) { try { return (long) SAMPLER_NEW.invokeExact(ctx, u, v, min, mag, mip, aniso, maxLod); } catch (Throwable t) { throw rethrow(t); } }
-	static long libraryNew(long ctx, long source, long err, int errCap) { try { return (long) LIBRARY_NEW.invokeExact(ctx, source, err, errCap); } catch (Throwable t) { throw rethrow(t); } }
+	static long libraryNew(long ctx, long source, int math, long err, int errCap) { try { return (long) LIBRARY_NEW.invokeExact(ctx, source, math, err, errCap); } catch (Throwable t) { throw rethrow(t); } }
 	static long pipelineNew(long ctx, long vlib, long vname, long flib, long fname, long desc, long err, int errCap) { try { return (long) PIPELINE_NEW.invokeExact(ctx, vlib, vname, flib, fname, desc, err, errCap); } catch (Throwable t) { throw rethrow(t); } }
 	static long depthStateNew(long ctx, int compare, int write) { try { return (long) DEPTH_STATE_NEW.invokeExact(ctx, compare, write); } catch (Throwable t) { throw rethrow(t); } }
 	static long encNew(long ctx) { try { return (long) ENC_NEW.invokeExact(ctx); } catch (Throwable t) { throw rethrow(t); } }
@@ -230,6 +233,9 @@ final class Native {
 	static void layerConfigure(long ctx, long layer, int w, int h, int vsync) { try { LAYER_CONFIGURE.invokeExact(ctx, layer, w, h, vsync); } catch (Throwable t) { throw rethrow(t); } }
 	static long layerNext(long layer) { try { return (long) LAYER_NEXT.invokeExact(layer); } catch (Throwable t) { throw rethrow(t); } }
 	static void present(long enc, long drawable, long texture) { try { PRESENT.invokeExact(enc, drawable, texture); } catch (Throwable t) { throw rethrow(t); } }
+	static void presentSplit(long enc, long layer, long texture) { try { PRESENT_SPLIT.invokeExact(enc, layer, texture); } catch (Throwable t) { throw rethrow(t); } }
+	static void presentDrain() { try { PRESENT_DRAIN.invokeExact(); } catch (Throwable t) { throw rethrow(t); } }
+	static boolean presentReady(long ctx) { try { return (int) PRESENT_READY.invokeExact(ctx) != 0; } catch (Throwable t) { throw rethrow(t); } }
 	static void sleepPrecise(long ns) { try { SLEEP_PRECISE.invokeExact(ns); } catch (Throwable t) { throw rethrow(t); } }
 	static boolean pace(double marginSeconds) { try { return (int) PACE.invokeExact(marginSeconds) != 0; } catch (Throwable t) { throw rethrow(t); } }
 	static int probe(long ctx, long draws, int count, int totalQuads, long globals, long globalsOffset, long atlas, long atlasSampler, int width, int height,

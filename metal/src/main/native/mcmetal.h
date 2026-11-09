@@ -11,6 +11,14 @@ typedef struct {
 	id<MTLDepthStencilState> depthWrite, depthKeep;
 	id<MTLBuffer> fanIndices;  // {0, k+1, k+2} per triangle: Metal has no fans, so they're drawn as indexed triangle lists
 	id<MTLComputePipelineState> motion;  // motion_cs, for the temporal upscaler
+	// Split present (vsync off, see mc_present_split): taking a drawable, the copy into it and the present happen off the
+	// render thread and on this queue, so a drawable the compositor still holds delays only that, not the game's frames.
+	id<MTLCommandQueue> presentQueue;
+	id<MTLSharedEvent> presentEvent;  // signalled by a frame once its picture is in presentStage, waited on by its present
+	uint64_t presentSignal;
+	id<MTLTexture> presentStage[2];  // each frame's finished picture, until its present has drawn it into the drawable
+	int presentBusy[2];  // (__atomic) 1 from the frame's copy until its present command buffer completes
+	int presentNext;
 } Ctx;
 
 #define MAX_COLORS 8

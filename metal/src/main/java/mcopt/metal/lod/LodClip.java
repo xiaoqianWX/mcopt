@@ -415,6 +415,33 @@ final class LodClip {
 		return w;
 	}
 
+	/**
+	 * Whether the walk finds anything at block (bx, bz) drawing it at `level`: a cell with data there at that level or, as the
+	 * walk falls back, at a coarser one.
+	 */
+	boolean covered(int level, int bx, int bz) {
+		for (int k = level; k < this.levels; k++) {
+			int cx = bx >> k, cz = bz >> k;
+			if (!this.resident(k, Math.floorDiv(cx, TILE), Math.floorDiv(cz, TILE))) continue;
+			if ((MemoryUtil.memGetInt(this.geom + this.cellOffset(k, cx, cz) * 4) & GEOM_VALID) != 0) return true;
+		}
+		return false;
+	}
+
+	/** A resident cell's geometry word, as real chunks last left it (a staged copy's, when one waits). */
+	int cellGeom(int level, int cx, int cz) {
+		Snapshot s = this.staging() ? this.staged.get(LodTile.key(level, Math.floorDiv(cx, TILE), Math.floorDiv(cz, TILE))) : null;
+		if (s != null) return s.g[(cz - s.tz * TILE) * TILE + (cx - s.tx * TILE)];
+		return MemoryUtil.memGetInt(this.geom + this.cellOffset(level, cx, cz) * 4);
+	}
+
+	/** A resident cell's color word (see cellGeom). */
+	int cellColor(int level, int cx, int cz) {
+		Snapshot s = this.staging() ? this.staged.get(LodTile.key(level, Math.floorDiv(cx, TILE), Math.floorDiv(cz, TILE))) : null;
+		if (s != null) return s.c[(cz - s.tz * TILE) * TILE + (cx - s.tx * TILE)];
+		return MemoryUtil.memGetInt(this.color + this.cellOffset(level, cx, cz) * 4);
+	}
+
 	/** Overwrites one cell of a resident tile (real chunks); the caller refreshes the tile's maxima with refresh(). */
 	void putCell(int level, int cx, int cz, int g, int c, int cr, int tw, int runs, int plantA, int plantB) {
 		if (this.staging()) {

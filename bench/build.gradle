@@ -1,0 +1,27 @@
+plugins {
+	id 'net.fabricmc.fabric-loom' version "${loom_version}"
+}
+
+// Dev-only benchmark driver (tools/bench.py): never part of a release.
+version = '0.1.0'
+
+repositories {
+	// Sodium at build time only (compileOnly): the settle check asks it whether the terrain is built, when it's there.
+	maven {
+		url = 'https://api.modrinth.com/maven'
+		content { includeGroup 'maven.modrinth' }
+	}
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:${minecraft_version}"
+	implementation "net.fabricmc:fabric-loader:${loader_version}"
+	compileOnly "maven.modrinth:sodium:${sodium_version}"
+}
+
+processResources {
+	inputs.property 'version', version
+	filesMatching('fabric.mod.json') { expand 'version': version }
+}
+
+tasks.withType(JavaCompile).configureEach { it.options.release = 25 }

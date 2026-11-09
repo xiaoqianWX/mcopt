@@ -8,6 +8,7 @@ import net.minecraft.tags.FluidTags;
 import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.RenderShape;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -24,13 +25,15 @@ import net.minecraft.world.level.levelgen.Heightmap;
 final class LodChunks {
 	/**
 	 * What the render thread copies out of a chunk, per column: the ground (its top block or the floor under water, what is
-	 * under it, its top face, the water's), and a tree crown over air if one floats there (its top block, lowest and top y).
+	 * under it, its top face, the water's), and a tree crown over air if one floats there (its top block, lowest and top y),
+	 * or a build over open air (build: crown its top block, crownLeaf the top of its run of blocks; the ground the first block
+	 * under the air, or the world's floor over the void).
 	 * For the solid runs (-Dmcopt.lod.realOcc only): the y each column's run starts at (its ground's top block; Short.MIN_VALUE:
 	 * none, under water), and copies of the chunk's sections it can reach (sections[i]: section secFirst + i; null: only air).
 	 */
 	record Snapshot(int chunkX, int chunkZ, BlockState[] top, BlockState[] under, short[] height, short[] water, Holder<Biome>[] biome,
 		BlockState[] crown, BlockState[] crownLeaf, short[] crownLo, short[] crownHi, int[] crownRuns, BlockState[] trunk, BlockState[] above,
-		short[] runFrom, PalettedContainer<BlockState>[] sections, int secFirst, int minY) {
+		short[] runFrom, PalettedContainer<BlockState>[] sections, int secFirst, int minY, boolean[] build) {
 	}
 
 	/**
@@ -44,17 +47,63 @@ final class LodChunks {
 	 * more; 0: none): under it may be air, a cave or the space under an overhang.
 	 */
 	record Summary(int chunkX, int chunkZ, short[] height, short[] water, int[] top, int[] side, int[] below, boolean[] fringe, short[] crownLo,
-		short[] crownHi, int[] groundColor, int[] tex, int[] runs, int[] plantA, int[] plantB, boolean[] clear, byte[] depth) {
+		short[] crownHi, int[] groundColor, int[] tex, int[] runs, int[] plantA, int[] plantB, boolean[] clear, byte[] depth, boolean[] build) {
 	}
 
 	private LodChunks() {
 	}
 
-	/** A plant, torch or flower over the ground: seen from far away the ground shows. Snow layers count as ground. */
+	/**
+	 * A plant, torch or flower over the ground: seen from far away the ground shows. Snow layers count as ground. So do blocks
+	 * the game draws nothing for (barriers, light blocks: servers wall and roof areas with them).
+	 */
 	private static boolean decoration(BlockState s) {
 		// (powder snow has no collision shape for a query without an entity, but it is a block of snow to the eye)
 		return !s.isAir() && s.getFluidState().isEmpty() && !s.is(Blocks.SNOW) && !s.is(Blocks.POWDER_SNOW)
-			&& s.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO).isEmpty();
+			&& (s.getRenderShape() == RenderShape.INVISIBLE || s.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO).isEmpty());
+	}
+
+	/** What the eye sees through from afar: air, or a decoration. */
+	private static boolean open(BlockState s) {
+		return s.isAir() || decoration(s);
+	}
+
+	/** A run of blocks at most this thick over at least this much open space is a build floating over what is under it. */
+	static final int FLOAT_THICK = 40, FLOAT_GAP = 12;
+
+	/** Down from y to the first block that isn't open, past sections of only air: its y, or minY - 1 when there's none. */
+	private static int firstBlock(LevelChunk chunk, BlockPos.MutableBlockPos pos, int px, int pz, int y, int minY) {
+		while (y >= minY) {
+			if (chunk.getSection(chunk.getSectionIndex(y)).hasOnlyAir()) {
+				y = minY + ((y - minY) & ~15) - 1;
+				continue;
+			}
+			if (!open(chunk.getBlockState(pos.set(px, y, pz)))) return y;
+			y--;
+		}
+		return minY - 1;
+	}
+
+	/**
+	 * Whether the blocks down from y (a block that isn't open) are a run of fewer than FLOAT_THICK over FLOAT_GAP or more of
+	 * open space (a platform, a bridge, an overhang, a floating island; not a room: its air is lower): then out[0] is the
+	 * run's lowest y and out[1] the first block's under the space (minY - 1: none, the void). It probes first, FLOAT_GAP apart
+	 * over where such a space can start, so a column of solid ground costs four lookups.
+	 */
+	private static boolean floating(LevelChunk chunk, BlockPos.MutableBlockPos pos, int px, int pz, int y, int minY, int[] out) {
+		boolean probe = false;
+		for (int d = FLOAT_GAP; d < FLOAT_THICK + FLOAT_GAP && !probe && y - d >= minY; d += FLOAT_GAP) {
+			probe = open(chunk.getBlockState(pos.set(px, y - d, pz)));
+		}
+		if (!probe) return false;
+		int k = y - 1;
+		while (k >= minY && y - k < FLOAT_THICK && !open(chunk.getBlockState(pos.set(px, k, pz)))) k--;
+		if (k < minY || y - k >= FLOAT_THICK) return false;
+		int ground = firstBlock(chunk, pos, px, pz, k, minY);
+		if (k - ground < FLOAT_GAP) return false;
+		out[0] = k + 1;
+		out[1] = ground;
+		return true;
 	}
 
 	private static boolean crownBlock(BlockState s) {
@@ -99,6 +148,8 @@ final class LodChunks {
 		BlockState[] top = new BlockState[256], under = new BlockState[256], crown = new BlockState[256], crownLeaf = new BlockState[256];
 		short[] height = new short[256], water = new short[256], crownLo = new short[256], crownHi = new short[256];
 		int[] crownRuns = new int[256];
+		boolean[] build = new boolean[256];
+		int[] fl = new int[2];
 		BlockState[] trunk = new BlockState[256];
 		// up to 3 blocks over the ground where a decoration stands on it (a plant, for the worker to tell)
 		BlockState[] above = new BlockState[256 * 3];
@@ -111,9 +162,8 @@ final class LodChunks {
 			for (int x = 0; x < 16; x++) {
 				int i = z * 16 + x;
 				int px = bx0 + x, pz = bz0 + z;
-				int y = chunk.getHeight(Heightmap.Types.WORLD_SURFACE, x, z);
+				int y = firstBlock(chunk, pos, px, pz, chunk.getHeight(Heightmap.Types.WORLD_SURFACE, x, z), minY);
 				BlockState s = chunk.getBlockState(pos.set(px, y, pz));
-				for (int guard = 0; guard < 8 && y > minY && (s.isAir() || decoration(s)); guard++) s = chunk.getBlockState(pos.set(px, --y, pz));
 				crownLo[i] = Short.MIN_VALUE;
 				crown[i] = null;
 				if (crownBlock(s)) {
@@ -152,6 +202,24 @@ final class LodChunks {
 						crownHi[i] = (short) (topState.is(Blocks.SNOW) ? topY : topY + 1);
 						y = k;
 						s = b;
+					}
+				}
+				if (crown[i] == null && y > minY && s.getFluidState().isEmpty()) {
+					// a build over open space floats over what is under it, as a crown does, instead of standing on it as a
+					// pillar (snow on it is a covering, as on the ground)
+					int runTop = s.is(Blocks.SNOW) ? y - 1 : y;
+					BlockState rs = runTop == y ? s : chunk.getBlockState(pos.set(px, runTop, pz));
+					if (!open(rs) && floating(chunk, pos, px, pz, runTop, minY, fl)) {
+						crown[i] = s;
+						crownLeaf[i] = rs;
+						crownLo[i] = (short) fl[0];
+						crownHi[i] = (short) (runTop + 1);
+						crownRuns[i] = 0;
+						trunk[i] = null;
+						build[i] = true;
+						// (over the void: the world's floor, as a column with nothing in it)
+						y = fl[1];
+						s = chunk.getBlockState(pos.set(px, y, pz));
 					}
 				}
 				short wet = LodTile.DRY;
@@ -198,7 +266,7 @@ final class LodChunks {
 			}
 		}
 		return new Snapshot(chunk.getPos().x(), chunk.getPos().z(), top, under, height, water, biome, crown, crownLeaf, crownLo, crownHi, crownRuns, trunk, above,
-			runFrom, sections, secFirst, minY);
+			runFrom, sections, secFirst, minY, build);
 	}
 
 	private static final BlockState WATER = Blocks.WATER.defaultBlockState();
@@ -257,7 +325,15 @@ final class LodChunks {
 				BlockState belowState = s.trunk[i] != null && s.crown[i] == null ? s.trunk[i] : layer ? sideState : s.under[i];
 				tex[i] = s.water[i] != LodTile.DRY ? 0 : LodPalette.word(LodPalette.id(s.top[i]), LodPalette.id(sideState), LodPalette.id(belowState));
 			}
-			if (s.crown[i] != null) {
+			if (s.crown[i] != null && s.build[i]) {
+				// a build over open space: its top block's colors (a snow layer's on top), its run's top block on its sides
+				groundColor[i] = color;
+				BlockState ground = s.top[i].is(Blocks.SNOW) ? s.under[i] : s.top[i];
+				color = LodColors.top(s.crown[i], b, x, z);
+				sideColor = LodColors.side(s.crownLeaf[i], b, x, z);
+				crownHi[i] = s.crownHi[i];
+				if (LodConfig.TEXTURES) tex[i] = LodPalette.word(LodPalette.id(s.crown[i]), LodPalette.id(s.crownLeaf[i]), LodPalette.id(ground));
+			} else if (s.crown[i] != null) {
 				// a crown over air: its own colors; the ground keeps its own under it
 				groundColor[i] = color;
 				BlockState leaf = s.crownLeaf[i];
@@ -283,6 +359,6 @@ final class LodChunks {
 			}
 		}
 		return new Summary(s.chunkX, s.chunkZ, s.height, s.water, top, side, below, fringe, s.crownLo, crownHi, groundColor, tex, s.crownRuns, plantA, plantB,
-			clear, solidDepth);
+			clear, solidDepth, s.build);
 	}
 }

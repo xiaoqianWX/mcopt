@@ -29,6 +29,11 @@ On a computer the mod can't run on (not an Apple Silicon Mac, or macOS older tha
 and says what's missing; remove mcopt-metal from the mods folder to play there.
 To check it's working, the game log says "Using graphics backend Metal".
 
+Options > Video Settings > General > Graphics API picks the renderer (restart to apply): Metal (mcopt) by default, or the
+game's own OpenGL or Vulkan (MoltenVK), with mcopt's other optimizations still on. Its tooltip, and the mcopt page in the
+same screen, say what's running now. With Iris installed, or Distant Horizons set to its OpenGL renderer, Metal steps
+aside on its own. Distant Horizons on its default renderer draws on Metal.
+
 mcopt turns on its measured speed-ups by itself (the alpha profile), picked for your Mac. The first launch writes
 config/mcopt.properties in your game folder; set profile=none there to run with only the Metal renderer.
 -Dmcopt.metal=false switches mcopt's renderer off.

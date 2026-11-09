@@ -15,7 +15,9 @@ public final class LodMixinPlugin implements IMixinConfigPlugin {
 		mcopt.metal.Profile.apply(); // before any flag is read
 	}
 
-	private static final boolean ENABLED = Boolean.getBoolean("mcopt.lod") || System.getProperty("mcopt.lod.radius") != null;
+	/** Off with Distant Horizons installed: it draws the far terrain, and two far terrains would fight over the fog and the frame. */
+	private static final boolean ENABLED = (Boolean.getBoolean("mcopt.lod") || System.getProperty("mcopt.lod.radius") != null)
+		&& !net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("distanthorizons");
 	/** -Dmcopt.lod.truthRd=N: ground-truth captures (real chunks past 32): only the LodTruth mixins, with or without far terrain. */
 	private static final boolean TRUTH = System.getProperty("mcopt.lod.truthRd") != null;
 	/** -Dmcopt.lod.fade=instant: Sodium's section fade-in off while far terrain draws (LodSodiumFadeMixin). */

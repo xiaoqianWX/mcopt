@@ -81,8 +81,9 @@ final class MetalPipeline implements BackendRenderPipeline {
 		long vlib = 0, flib = 0, plib = 0;
 		try (MemoryStack stack = MemoryStack.stackPush()) {
 			long err = stack.nmalloc(1, 4096);
-			Translated v = translate(vertex.module(), info.uniforms().size());
-			Translated f = translate(fragment.module(), info.uniforms().size());
+			boolean points = MetalConst.topologyClass(info.primitiveTopology()) == 1;
+			Translated v = translate(vertex.module(), info.uniforms().size(), points);
+			Translated f = translate(fragment.module(), info.uniforms().size(), points);
 			if (DUMP_DIR != null) dump(info.name(), v, f);
 			String defines = BUILTIN_MSL ? SODIUM_TERRAIN.get(info.name()) : null;
 			if (defines != null) {
@@ -98,9 +99,9 @@ final class MetalPipeline implements BackendRenderPipeline {
 				f = new Translated("// " + UNCACHED_NONCE + "\n" + f.msl, f.entry);
 			}
 			t1 = System.nanoTime();
-			vlib = Native.libraryNew(ctx, MemoryUtil.memAddress(stack.UTF8(v.msl)), err, 4096);
+			vlib = Native.libraryNew(ctx, MemoryUtil.memAddress(stack.UTF8(v.msl)), MATH, err, 4096);
 			if (vlib == 0) throw new IllegalStateException(info.name() + " vertex: " + MemoryUtil.memUTF8(err) + "\n" + v.msl);
-			flib = Native.libraryNew(ctx, MemoryUtil.memAddress(stack.UTF8(f.msl)), err, 4096);
+			flib = Native.libraryNew(ctx, MemoryUtil.memAddress(stack.UTF8(f.msl)), MATH, err, 4096);
 			if (flib == 0) throw new IllegalStateException(info.name() + " fragment: " + MemoryUtil.memUTF8(err) + "\n" + f.msl);
 			t2 = System.nanoTime();
 			long vname = MemoryUtil.memAddress(stack.UTF8(v.entry)), fname = MemoryUtil.memAddress(stack.UTF8(f.entry));
@@ -116,7 +117,7 @@ final class MetalPipeline implements BackendRenderPipeline {
 			if (defines != null && MetalTerrain.OCC && !info.name().contains("translucent")) {
 				// Translucent stays on Sodium's own draws: its quads are drawn in sorted index-buffer order.
 				String twin = "#define PULLED\n" + resource("sodium_terrain.vs.metal");
-				plib = Native.libraryNew(ctx, MemoryUtil.memAddress(stack.UTF8(twin)), err, 4096);
+				plib = Native.libraryNew(ctx, MemoryUtil.memAddress(stack.UTF8(twin)), MATH, err, 4096);
 				if (plib == 0) throw new IllegalStateException(info.name() + " pulled vertex: " + MemoryUtil.memUTF8(err));
 				pulled = Native.pipelineNew(ctx, plib, vname, flib, fname, describe(stack, info, true, false), err, 4096);
 				if (pulled == 0) throw new IllegalStateException(info.name() + " pulled: " + MemoryUtil.memUTF8(err));
@@ -150,6 +151,16 @@ final class MetalPipeline implements BackendRenderPipeline {
 	 */
 	private static final boolean UNCACHED = Boolean.getBoolean("mcopt.metal.uncachedMsl");
 	private static final long UNCACHED_NONCE = System.nanoTime();
+
+	/**
+	 * -Dmcopt.metal.math=relaxed|fast|safe: the MTLMathMode the game's shaders compile with. Relaxed (the default) optimizes
+	 * like fast but keeps infinities and NaNs, which shaders written for OpenGL and Vulkan rely on (see mc_library_new).
+	 */
+	private static final int MATH = switch (System.getProperty("mcopt.metal.math", "relaxed")) {
+		case "safe" -> 0;
+		case "fast" -> 2;
+		default -> 1;
+	};
 
 	/** -Dmcopt.metal.builtinMsl=false compiles Sodium's terrain from its own SPIR-V again, for A/B runs. */
 	private static final boolean BUILTIN_MSL = Boolean.parseBoolean(System.getProperty("mcopt.metal.builtinMsl", "true"));
@@ -262,18 +273,19 @@ final class MetalPipeline implements BackendRenderPipeline {
 	}
 	static int mslHits, mslMisses;
 
-	private static Translated translate(SpvModule module, int uniformCount) {
-		if (!MSL_CACHE) return translateNow(module, uniformCount);
+	private static Translated translate(SpvModule module, int uniformCount, boolean points) {
+		if (!MSL_CACHE) return translateNow(module, uniformCount, points);
 		String key;
 		try {
 			java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
 			md.update(MSL_KEY_SALT.getBytes(java.nio.charset.StandardCharsets.UTF_8));
 			md.update((byte) module.type().ordinal());
 			md.update(java.nio.ByteBuffer.allocate(4).putInt(uniformCount).array());
+			md.update((byte) (points ? 1 : 0));
 			md.update(module.spv().duplicate());
 			key = java.util.HexFormat.of().formatHex(md.digest());
 		} catch (java.security.NoSuchAlgorithmException e) {
-			return translateNow(module, uniformCount);
+			return translateNow(module, uniformCount, points);
 		}
 		java.nio.file.Path file = MSL_DIR.resolve(key);
 		try {
@@ -282,13 +294,13 @@ final class MetalPipeline implements BackendRenderPipeline {
 			if (nl > 0) {
 				mslHits++;
 				Translated hit = new Translated(text.substring(nl + 1), text.substring(0, nl));
-				if (MSL_MODE.equals("verify") && !hit.equals(translateNow(module, uniformCount))) mslMismatches++;
+				if (MSL_MODE.equals("verify") && !hit.equals(translateNow(module, uniformCount, points))) mslMismatches++;
 				return hit;
 			}
 		} catch (java.io.IOException missing) {
 			// not cached yet
 		}
-		Translated t = translateNow(module, uniformCount);
+		Translated t = translateNow(module, uniformCount, points);
 		mslMisses++;
 		try {
 			java.nio.file.Files.createDirectories(MSL_DIR);
@@ -301,7 +313,12 @@ final class MetalPipeline implements BackendRenderPipeline {
 		return t;
 	}
 
-	private static Translated translateNow(SpvModule module, int uniformCount) {
+	/**
+	 * points: the pipeline draws points. Only then may the vertex function write [[point_size]]: Metal rejects the pipeline
+	 * when a line or triangle pipeline's vertex shader writes it (OpenGL and Vulkan ignore the write), and mods' shaders do
+	 * (malilib's debug lines: "Vertex shader writes point size but inputPrimitiveTopology is MTLPrimitiveTopologyClassLine").
+	 */
+	private static Translated translateNow(SpvModule module, int uniformCount, boolean points) {
 		boolean vertex = module.type() == ShaderType.VERTEX;
 		int model = vertex ? Spv.SpvExecutionModelVertex : Spv.SpvExecutionModelFragment;
 		IntBuffer spirv = module.spv().asIntBuffer();
@@ -320,6 +337,7 @@ final class MetalPipeline implements BackendRenderPipeline {
 				spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_MSL_PLATFORM, SPVC_MSL_PLATFORM_MACOS);
 				spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_MSL_TEXTURE_BUFFER_NATIVE, true);
 				if (vertex) spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_FLIP_VERTEX_Y, true);
+				if (vertex) spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_MSL_ENABLE_POINT_SIZE_BUILTIN, points);
 				check(context, spvc_compiler_install_compiler_options(compiler, options), "install options");
 				for (int i = 0; i < uniformCount; i++) bind(stack, compiler, model, 0, i, i);
 				bind(stack, compiler, model, SPVC_MSL_PUSH_CONSTANT_DESC_SET, SPVC_MSL_PUSH_CONSTANT_BINDING, MetalConst.PUSH_CONSTANTS_INDEX);

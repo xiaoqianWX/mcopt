@@ -88,6 +88,8 @@ Ctx *mc_create(char *name, int nameCap, char *err, int errCap) {
 		}
 		ctx->motion = [device newComputePipelineStateWithFunction:[[lib newFunctionWithName:@"motion_cs"] autorelease] error:&e];
 		if (!ctx->motion) { copyError(e, err, errCap); return NULL; }
+		ctx->presentQueue = [device newCommandQueue];
+		ctx->presentEvent = [device newSharedEvent];
 		strlcpy(name, device.name.UTF8String, nameCap);
 		return ctx;
 	}
@@ -340,11 +342,14 @@ id<MTLSamplerState> mc_sampler_new(Ctx *ctx, int addressU, int addressV, int min
 
 // ---- pipelines ----
 
-id<MTLLibrary> mc_library_new(Ctx *ctx, const char *source, char *err, int errCap) {
+// math: an MTLMathMode. The game's shaders want Relaxed, not Fast: Fast assumes no infinities or NaNs, and shaders written
+// for OpenGL and Vulkan count on them. Sodium's terrain fade multiplies by 1 / fade-in time, +inf when that is 0 (Distant
+// Horizons sets it so); with Fast, clamp(t * inf, 0, 1) came out 0 and every chunk was drawn as solid fog.
+id<MTLLibrary> mc_library_new(Ctx *ctx, const char *source, int math, char *err, int errCap) {
 	@autoreleasepool {
 		MTLCompileOptions *o = [[MTLCompileOptions new] autorelease];
 		o.languageVersion = MTLLanguageVersion3_0;
-		o.mathMode = MTLMathModeFast;
+		o.mathMode = (MTLMathMode) math;
 		NSError *e = nil;
 		id<MTLLibrary> lib = [ctx->device newLibraryWithSource:[NSString stringWithUTF8String:source] options:o error:&e];
 		if (!lib) copyError(e, err, errCap);
@@ -1056,7 +1061,90 @@ id<CAMetalDrawable> mc_layer_next(CAMetalLayer *layer) {
 	}
 }
 
-// Draws src into the drawable (flipped back to top-down) and schedules the present on the current command buffer.
+// Whether a split present can be recorded now: the staging slot it would use is free, i.e. the present that last used it
+// has completed. When it isn't, the caller skips this frame's present rather than wait (vsync is off: the display couldn't
+// have shown it anyway).
+int mc_present_ready(Ctx *ctx) {
+	return __atomic_load_n(&ctx->presentBusy[ctx->presentNext], __ATOMIC_ACQUIRE) == 0;
+}
+
+static dispatch_queue_t presentDispatch;
+
+// The split present, used with vsync off. The frame's command buffer only copies src into a staging texture and signals
+// presentEvent; a serial dispatch queue then takes a drawable, draws the staging texture into it (on presentQueue, after
+// the signal) and presents it. Both waits that belong to the display stay off the render thread and off the frame's
+// command buffer: nextDrawable blocks while the compositor holds every drawable, and the GPU writes a drawable only once
+// the compositor has let go of it. With the copy on the frame's command buffer, that second wait held up the frame's
+// completion until the next refresh, and with two frames in flight the game ran at exactly two frames a refresh (240 fps
+// at 120 Hz), most of each frame spent waiting on the GPU; with nextDrawable on the render thread, a held drawable locked
+// it to the refresh rate. Now a frame whose staging slot is still busy just isn't presented (mc_present_ready).
+void mc_present_split(Enc *enc, CAMetalLayer *layer, id<MTLTexture> src) {
+	endBlit(enc);
+	endRender(enc);
+	Ctx *ctx = enc->ctx;
+	int slot = ctx->presentNext;
+	ctx->presentNext = (slot + 1) % 2;
+	id<MTLTexture> stage;
+	uint64_t value;
+	@autoreleasepool {
+		stage = ctx->presentStage[slot];
+		if (!stage || stage.width != src.width || stage.height != src.height || stage.pixelFormat != src.pixelFormat) {
+			[stage release]; // free: mc_present_ready said its present has completed
+			MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat width:src.width height:src.height mipmapped:NO];
+			d.usage = MTLTextureUsageShaderRead;
+			d.storageMode = MTLStorageModePrivate;
+			stage = ctx->presentStage[slot] = [ctx->device newTextureWithDescriptor:d];
+		}
+		id<MTLBlitCommandEncoder> b = [cmd(enc) blitCommandEncoder];
+		[b copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(src.width, src.height, 1)
+			toTexture:stage destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+		[b endEncoding];
+		value = ++ctx->presentSignal;
+		[cmd(enc) encodeSignalEvent:ctx->presentEvent value:value];
+	}
+	int *busy = &ctx->presentBusy[slot];
+	__atomic_store_n(busy, 1, __ATOMIC_RELEASE);
+	if (!presentDispatch) {
+		presentDispatch = dispatch_queue_create("mcopt present", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+	}
+	double encodedAt = CACurrentMediaTime();
+	// The block is copied by dispatch_async, which retains layer and stage (manual reference counting) until it has run.
+	dispatch_async(presentDispatch, ^{
+		@autoreleasepool {
+			id<CAMetalDrawable> drawable = [layer nextDrawable];
+			if (!drawable) { // window hidden
+				__atomic_store_n(busy, 0, __ATOMIC_RELEASE);
+				return;
+			}
+			id<MTLCommandBuffer> p = [ctx->presentQueue commandBuffer];
+			[p encodeWaitForEvent:ctx->presentEvent value:value];
+			MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+			rp.colorAttachments[0].texture = drawable.texture;
+			rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+			rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+			id<MTLRenderCommandEncoder> r = [p renderCommandEncoderWithDescriptor:rp];
+			[r setRenderPipelineState:ctx->present];
+			[r setFragmentTexture:stage atIndex:0];
+			[r setFragmentSamplerState:ctx->presentSampler atIndex:0];
+			[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+			[r endEncoding];
+			[p addCompletedHandler:^(id<MTLCommandBuffer> done) {
+				gpuLatency += (CACurrentMediaTime() - encodedAt - gpuLatency) * 0.1;
+				__atomic_store_n(busy, 0, __ATOMIC_RELEASE);
+			}];
+			[p presentDrawable:drawable];
+			[p commit];
+		}
+	});
+}
+
+// Waits for queued split presents to be handed to the GPU, before the layer goes away.
+void mc_present_drain(void) {
+	if (presentDispatch) dispatch_sync(presentDispatch, ^{});
+}
+
+// Draws src into the drawable (flipped back to top-down) and schedules the present on the frame's command buffer: with
+// vsync on, waiting for a free drawable is what paces the game to the display.
 void mc_present(Enc *enc, id<CAMetalDrawable> drawable, id<MTLTexture> src) {
 	endBlit(enc);
 	endRender(enc);

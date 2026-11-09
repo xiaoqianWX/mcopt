@@ -71,6 +71,8 @@ public final class Cpu {
 	/** MetalTerrain's per-frame choice: Sodium's solid/cutout terrain is recorded for the occlusion split (set at each frame's end). */
 	public static volatile boolean terrainSplitting = true;
 	public static final int LOADING_FPS = Integer.getInteger("mcopt.cpu.loadingFps", 0);
+	/** -Dmcopt.cpu.textBatch=true: the world's opaque text (signs) written a render type at a time, one draw per glyph page and mode (TextBatch). */
+	public static final boolean TEXT_BATCH = Boolean.getBoolean("mcopt.cpu.textBatch");
 
 	private Cpu() {
 	}

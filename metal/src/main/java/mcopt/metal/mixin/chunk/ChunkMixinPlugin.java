@@ -13,7 +13,7 @@ import org.spongepowered.asm.mixin.extensibility.IMixinInfo;
  * Each chunk mixin applies only when its -Dmcopt.chunk.* switch is set (ChunkOpt.mixinEnabled), so by default nothing changes.
  * Mixins that rewrite methods other optimization mods also rewrite step aside when such a mod is loaded (that mod's version of
  * the optimization then applies): Lithium (POI scans, random ticks, chunk access), ScalableLux (the light engine), C2ME (chunk
- * IO, serialization, chunk access).
+ * IO, serialization, chunk access). The mesher fast path also steps aside for Iris, which hooks into the same Sodium method.
  */
 public final class ChunkMixinPlugin implements IMixinConfigPlugin {
 	static {
@@ -27,7 +27,9 @@ public final class ChunkMixinPlugin implements IMixinConfigPlugin {
 		"BlockLightMapMixin", List.of("scalablelux"),
 		"SkyLightMapMixin", List.of("scalablelux"),
 		"RegionFileStorageMixin", List.of("c2me"),
-		"PalettedContainerFactoryMixin", List.of("c2me"));
+		"PalettedContainerFactoryMixin", List.of("c2me"),
+		// Iris injects into the renderModel this rewrites (shader pack transparency); with both, Iris' mixin fails to apply
+		"BlockRendererMixin", List.of("iris"));
 
 	@Override public void onLoad(String mixinPackage) { }
 	@Override public String getRefMapperConfig() { return null; }

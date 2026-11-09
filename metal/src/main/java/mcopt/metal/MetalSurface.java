@@ -17,7 +17,13 @@ final class MetalSurface implements GpuSurfaceBackend {
 	private static final boolean PACE = Boolean.parseBoolean(System.getProperty("mcopt.metal.pace", "true"));
 	/** How long before a refresh a finished frame has to reach the compositor to be shown on it. */
 	private static final double PACE_MARGIN_S = 0.002;
-	private boolean paced;
+	/**
+	 * With vsync off, the drawable is taken, drawn and presented off the render thread and off the frame's command buffer
+	 * (see mc_present_split); -Dmcopt.metal.splitPresent=false keeps both on them. The opt-in cadence probe (GpuTimes) needs
+	 * the drawable here, so it keeps the old path.
+	 */
+	private static final boolean SPLIT = Boolean.parseBoolean(System.getProperty("mcopt.metal.splitPresent", "true"));
+	private boolean paced, split;
 	private final long ctx;
 	private final MetalEncoder encoder;
 	private final long view;
@@ -36,6 +42,7 @@ final class MetalSurface implements GpuSurfaceBackend {
 		// Frame generation schedules every present on the display's refresh grid, which needs vsync (FrameGen).
 		Native.layerConfigure(this.ctx, this.layer, config.width(), config.height(), vsync || FrameGen.ENABLED ? 1 : 0);
 		this.paced = !vsync && PACE && !FrameGen.ENABLED;
+		this.split = !vsync && SPLIT && !FrameGen.ENABLED && !MetalEncoder.GPU_TIMES;
 	}
 
 	@Override
@@ -57,12 +64,18 @@ final class MetalSurface implements GpuSurfaceBackend {
 			return;
 		}
 		if (this.paced && !Native.pace(PACE_MARGIN_S)) return;
+		if (this.split) {
+			// both staging slots still waiting on the compositor: skip this frame's present rather than wait
+			if (Native.presentReady(this.ctx)) this.encoder.presentSplit(this.layer, textureView);
+			return;
+		}
 		MetalEvents.Operation event = MetalEvents.begin("nextDrawable", -1, 0);
-		long drawable;
+		long drawable, start = System.nanoTime();
 		try {
 			drawable = Native.layerNext(this.layer);
 		} finally {
 			MetalEvents.end(event);
+			this.encoder.drawableNanos += System.nanoTime() - start;
 		}
 		if (drawable == 0) return; // no drawable (window hidden): skip the frame's present
 		this.encoder.presentTexture(drawable, textureView);
@@ -86,6 +99,7 @@ final class MetalSurface implements GpuSurfaceBackend {
 	public void close() {
 		FrameGen frameGen = FrameGen.ENABLED ? FrameGen.get(this.encoder) : null;
 		if (frameGen != null) frameGen.close();
+		Native.presentDrain(); // queued split presents still use the layer
 		SDLMetal.SDL_Metal_DestroyView(this.view);
 	}
 }

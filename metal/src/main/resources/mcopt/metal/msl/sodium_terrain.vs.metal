@@ -40,6 +40,17 @@ struct main0_out {
 // What Sodium's push constants carry per region: camera-relative origin, ms since the region was created, region id.
 struct Region { packed_float3 origin; int time; uint id; };
 
+// One fog range, normalized: Sodium's linear_fog_value is 0 up to start, 1 from end and linear between, so on a triangle
+// interpolating (d - start) / (end - start) and saturating per fragment gives the same. With start at or past end that
+// division turns around: Distant Horizons switches vanilla fog off by moving start out to 4e14 while end stays at the render
+// distance, and the linear form came out at 1 there (every chunk drawn as solid fog) where Sodium's branches give 0. Then
+// it's Sodium's step. Clamped so the half stays finite (an infinite output interpolates to NaN where a weight is 0).
+static half fogRange(float d, float2 f) {
+    float range = f.y - f.x;
+    float v = range > 0.0 ? (d - f.x) / range : (d <= f.x ? 0.0 : 1.0);
+    return half(clamp(v, -1024.0, 1024.0));
+}
+
 static main0_out shade(uint2 a_Position, float4 a_Color, uint2 a_TexCoord, uint4 a_LightAndData, Region r, constant u_Globals& g,
                        texture_buffer<int> sectionTimeInfo, texture2d<float> lightTex, sampler lightSampler)
 {
@@ -52,11 +63,11 @@ static main0_out shade(uint2 a_Position, float4 a_Color, uint2 a_TexCoord, uint4
 
     float cylindrical = max(length(position.xz), abs(position.y));
     float spherical = length(position);
-    out.v_Fog = half2((spherical - g.u_EnvironmentFog.x) / (g.u_EnvironmentFog.y - g.u_EnvironmentFog.x),
-                      (cylindrical - g.u_RenderFog.x) / (g.u_RenderFog.y - g.u_RenderFog.x));
+    out.v_Fog = half2(fogRange(spherical, g.u_EnvironmentFog), fogRange(cylindrical, g.u_RenderFog));
 
     int chunkFade = sectionTimeInfo.read(r.id * 256u + drawId).x;
-    half fade = chunkFade < 0 ? 1.0h : half(clamp(float(r.time - chunkFade) * g.u_FadePeriodInv, 0.0, 1.0));
+    // a fade-in time of 0 (Distant Horizons sets it) makes u_FadePeriodInv +inf: no fade, whatever the math mode does with inf
+    half fade = chunkFade < 0 || g.u_FadePeriodInv > 1e30 ? 1.0h : half(clamp(float(r.time - chunkFade) * g.u_FadePeriodInv, 0.0, 1.0));
     if (fade < 1.0h) out.v_Fog.x = max(out.v_Fog.x, half(1.0 - float(fade)));
 
     out.gl_Position = (g.u_ProjectionMatrix * g.u_ModelViewMatrix) * float4(position, 1.0);

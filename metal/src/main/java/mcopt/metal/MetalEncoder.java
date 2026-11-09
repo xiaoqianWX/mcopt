@@ -42,7 +42,7 @@ final class MetalEncoder implements CommandEncoderBackend {
 	/** Above this, an upload is cheaper as an async GPU blit than as a memcpy on the render thread. */
 	private static final long CPU_COPY_MAX = 256 << 10;
 	private static final int PROFILE_FRAMES = 100, PROFILE_ENCODERS = 16;
-	private static final boolean GPU_TIMES = Boolean.getBoolean("mcopt.metal.gpuTimes");
+	static final boolean GPU_TIMES = Boolean.getBoolean("mcopt.metal.gpuTimes");
 	private static final boolean STATS = Boolean.getBoolean("mcopt.metal.stats");
 
 	final long ctx;
@@ -64,6 +64,8 @@ final class MetalEncoder implements CommandEncoderBackend {
 	private final double[] profileSums = new double[1 + 2 * PROFILE_ENCODERS];
 	private int profiledFrames;
 	private long waitNanos, statStart, statTerrainFrames;
+	/** Time the render thread spent in nextDrawable (MetalSurface), for stats. */
+	long drawableNanos;
 	private int statFrames, statPresents;
 
 	private record Frame(long index, long cmd, List<Runnable> after) {
@@ -159,18 +161,20 @@ final class MetalEncoder implements CommandEncoderBackend {
 		if (this.statStart == 0) this.statStart = now;
 		if (now - this.statStart < 1_000_000_000L) return;
 		double frameMs = (now - this.statStart) / 1e6 / this.statFrames;
-		System.out.printf("mcopt-metal stats: %d fps, %.3f ms/frame, %.3f ms of it waiting on the GPU, %d presents%n", this.statFrames,
-			frameMs, this.waitNanos / 1e6 / this.statFrames, this.statPresents);
+		// println, not printf: the game's stdout logger only takes println, so printf output never reaches latest.log
+		System.out.println(String.format("mcopt-metal stats: %d fps, %.3f ms/frame, %.3f ms of it waiting on the GPU, %.3f ms on a drawable, %d presents", this.statFrames,
+			frameMs, this.waitNanos / 1e6 / this.statFrames, this.drawableNanos / 1e6 / this.statFrames, this.statPresents));
 		if (MetalTerrain.OCC) {
 			long[] t = this.terrain.lastCompletedCounts();
-			System.out.printf("mcopt-metal stats: terrain drew %d of %d quads (%.1f%%), %d before the split, %d chunks (%.1f quads each), %d frames drew terrain%n", t[0], t[1],
-				100.0 * t[0] / Math.max(1, t[1]), t[2], t[3], (double) t[1] / Math.max(1, t[3]), this.terrain.terrainFrames - this.statTerrainFrames);
+			System.out.println(String.format("mcopt-metal stats: terrain drew %d of %d quads (%.1f%%), %d before the split, %d chunks (%.1f quads each), %d frames drew terrain", t[0], t[1],
+				100.0 * t[0] / Math.max(1, t[1]), t[2], t[3], (double) t[1] / Math.max(1, t[3]), this.terrain.terrainFrames - this.statTerrainFrames));
 			this.statTerrainFrames = this.terrain.terrainFrames;
 		}
 		this.statStart = now;
 		this.statFrames = 0;
 		this.statPresents = 0;
 		this.waitNanos = 0;
+		this.drawableNanos = 0;
 	}
 
 	/** GPU timestamps cover the traced submit and the PROFILE_FRAMES - 1 after it; one frame alone is too noisy to compare shader variants. */
@@ -576,6 +580,19 @@ final class MetalEncoder implements CommandEncoderBackend {
 
 	@Override
 	public void writeTimestamp(GpuQueryPool pool, int index) {
+	}
+
+	/** The split present (vsync off): the frame copies the view aside, and the drawable is taken and drawn off this thread (mc_present_split). */
+	void presentSplit(long layer, GpuTextureView view) {
+		MetalEvents.Operation event = MetalEvents.begin("present", this.submitIndex, 0);
+		try {
+			this.trace("present", view);
+			this.flushClear(view.texture());
+			Native.presentSplit(this.enc, layer, ((MetalTexture.View) view).handle);
+			this.statPresents++;
+		} finally {
+			MetalEvents.end(event);
+		}
 	}
 
 	void presentTexture(long drawable, GpuTextureView view) {

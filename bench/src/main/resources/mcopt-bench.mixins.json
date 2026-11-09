@@ -1,0 +1,8 @@
+{
+	"required": true,
+	"package": "mcopt.bench.mixin",
+	"plugin": "mcopt.bench.BenchMixinPlugin",
+	"compatibilityLevel": "JAVA_25",
+	"client": ["CameraMixin", "MinecraftMixin", "MouseHandlerMixin"],
+	"injectors": { "defaultRequire": 1 }
+}

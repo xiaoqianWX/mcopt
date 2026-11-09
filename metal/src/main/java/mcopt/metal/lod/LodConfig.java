@@ -7,15 +7,19 @@ package mcopt.metal.lod;
 public final class LodConfig {
 	/** -Dmcopt.lod=true: far terrain on. A radius alone turns it on too. */
 	public static final boolean ENABLED = Boolean.getBoolean("mcopt.lod") || System.getProperty("mcopt.lod.radius") != null;
-	/** -Dmcopt.lod.radius=N: how far the far terrain reaches, in chunks (to the edge of the coarsest tiles drawn). */
-	public static final int RADIUS_CHUNKS = Integer.getInteger("mcopt.lod.radius", 512);
+	/**
+	 * How far the far terrain reaches at launch, in chunks (to the edge of the coarsest tiles drawn): the Distance setting
+	 * (mcopt.lod.distance), or -Dmcopt.lod.radius=N, which also turns far terrain on. The setting can change it in game
+	 * (FarTerrain): reachBlocks() is the reach the far terrain is built for now.
+	 */
+	public static final int RADIUS_CHUNKS = mcopt.metal.FarTerrain.distanceChunks();
 	/**
 	 * -Dmcopt.lod.n=N: cells across each clipmap level's window (a power of two). Level L's cells are 2^L blocks and it is drawn
 	 * out to (N / 2 - 64) x 2^L blocks, so on screen a cell is never more than about twice what a real block at that distance
 	 * would be, and N sets how big that is: at 5K, 2048 gives cells of 2.5-5 px (level 0 to ~960 blocks), 4096 1.2-2.5 px.
 	 * Memory: 8 N^2 bytes a level.
 	 */
-	public static final int N = Integer.getInteger("mcopt.lod.n", 2048);
+	public static final int N = Integer.getInteger("mcopt.lod.n", 2048);   // (the Detail setting, FarTerrain.n(), can change it in game)
 	/** -Dmcopt.lod.threads=N: generation workers (default: the cores the game and the GPU driver leave). */
 	public static final int THREADS = Integer.getInteger("mcopt.lod.threads", Math.max(2, Runtime.getRuntime().availableProcessors() - 4));
 	/**
@@ -67,7 +71,7 @@ public final class LodConfig {
 	 * first (surface, trees, plants, blocks), the agreement logged as it accumulates (mcopt-lod: verify).
 	 */
 	public static final boolean VERIFY = Boolean.getBoolean("mcopt.lod.verify");
-	/** -Dmcopt.lod.cache=false: no disk cache (every tile generated again each session). */
+	/** -Dmcopt.lod.cache=false: no disk cache (every tile generated again each session; on servers, as the Session choice). */
 	public static final boolean DISK_CACHE = Boolean.parseBoolean(System.getProperty("mcopt.lod.cache", "true"));
 	/** -Dmcopt.lod.cacheDir=PATH: where the per-world cache lives (default: the game dir's mcopt-lod). */
 	public static final String CACHE_DIR = System.getProperty("mcopt.lod.cacheDir");
@@ -78,11 +82,7 @@ public final class LodConfig {
 	 * tenth of the reach (4 to 64 blocks).
 	 */
 	public static final double FOG_START = Double.parseDouble(System.getProperty("mcopt.lod.fogStart", "-1"));
-	/**
-	 * -Dmcopt.lod.haze=H: the game's environmental (linear) fog range is stretched to H x the reach when that is longer than
-	 * the game's 1024 blocks: far terrain fades into the fog color with distance. Default 1.
-	 */
-	public static final double HAZE = Double.parseDouble(System.getProperty("mcopt.lod.haze", "1.0"));
+	// (-Dmcopt.lod.haze, the Haze setting: FarTerrain.hazeFactor(), read every frame)
 	/**
 	 * -Dmcopt.lod.render=walk|mesh: the far terrain drawn by the column walk (a compute pass per screen column over the
 	 * clipmap, composited in the level pass) or rasterized from per-tile meshes of the same cells (LodMesh: a GPU cull, then
@@ -107,8 +107,10 @@ public final class LodConfig {
 	private LodConfig() {
 	}
 
-	/** The reach in blocks. */
+	/** The reach the far terrain is built for now, in blocks (set by Lod when it builds the clipmap). */
+	static volatile double reach = RADIUS_CHUNKS * 16.0;
+
 	public static double reachBlocks() {
-		return RADIUS_CHUNKS * 16.0;
+		return reach;
 	}
 }

@@ -25,6 +25,7 @@ public final class CpuMixinPlugin implements IMixinConfigPlugin {
 		if (name.startsWith("Model")) return Cpu.MODEL;
 		if (name.startsWith("EntityBox") || name.startsWith("EntityRendererBox")) return mcopt.metal.cpu.EntityBox.ON;
 		if (name.startsWith("Loading")) return Cpu.LOADING_FPS > 0;
+		if (name.startsWith("TextBatch")) return Cpu.TEXT_BATCH;
 		return false;
 	}
 	@Override public void acceptTargets(Set<String> myTargets, Set<String> otherTargets) { }

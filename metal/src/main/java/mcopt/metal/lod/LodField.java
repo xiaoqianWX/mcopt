@@ -30,19 +30,30 @@ import org.joml.FrustumIntersection;
  * sooner; tripled when out of view); a worker loads the tile from the disk cache or generates it from the world
  * generator's noise, packs it into the clipmap's words, and the render thread writes it into the window.
  *
- * The game's own chunks overwrite the generated estimate: level 0 cell for cell, coarser levels at their sample points.
+ * The game's own chunks overwrite the generated estimate: level 0 cell for cell, each coarser cell from the columns under it.
  * Tiles that took real chunks are saved back to the cache from the clipmap every few seconds.
+ *
+ * Without a generator (noise null: a server's world, or one that isn't noise-generated) the chunks are all there is: a tile
+ * the cache doesn't have starts empty (every cell "no data", where the walk falls back to a coarser level) and the chunks
+ * the client receives fill it in, so the far terrain is wherever the player has been and grows as they explore.
  */
 final class LodField {
-	static final int FORMAT = 10;
-	final LodNoise noise;
+	/** 11: coarser cells from all the real columns under them (10 took the one at their corner: pillars of builds). */
+	static final int FORMAT = 11;
+	/** The world generator's noise, or null: far terrain from the game's own chunks only. */
+	final @org.jspecify.annotations.Nullable LodNoise noise;
+	/** No generator: tiles come from the cache and the chunks the client receives (noise == null). */
+	final boolean chunksOnly;
 	final LodClip clip;
 	/** The game's own trees on level-0 tiles (null: -Dmcopt.lod.trees=false). */
 	final @org.jspecify.annotations.Nullable LodForest forest;
 	final Path cache;
+	/** Tiles are read from and written to the cache (false: -Dmcopt.lod.cache=false, or a server on Session). */
+	final boolean persist;
 	private final ConcurrentHashMap<Long, Boolean> pending = new ConcurrentHashMap<>();
 	private final PriorityBlockingQueue<Job> jobs = new PriorityBlockingQueue<>();
 	private final ConcurrentLinkedQueue<Runnable> results = new ConcurrentLinkedQueue<>();
+	private final ConcurrentLinkedQueue<Runnable> saves = new ConcurrentLinkedQueue<>();
 	private final List<Thread> threads = new ArrayList<>();
 	private volatile boolean closed;
 	private final AtomicLong seq = new AtomicLong();
@@ -51,6 +62,8 @@ final class LodField {
 
 	// stats
 	final AtomicLong generated = new AtomicLong(), loaded = new AtomicLong(), genNanos = new AtomicLong(), chunksSummarized = new AtomicLong();
+	/** chunksOnly: tiles that started empty (neither cached nor generated). */
+	final AtomicLong empty = new AtomicLong();
 	/** Render thread: chunks snapshotted and the time it took (ns). */
 	long snapshots, snapNanos;
 	long startNanos = System.nanoTime(), settledNanos, firstSettledNanos;
@@ -65,11 +78,13 @@ final class LodField {
 		}
 	}
 
-	LodField(LodNoise noise, LodClip clip, Path cache) {
+	LodField(@org.jspecify.annotations.Nullable LodNoise noise, LodClip clip, Path cache, boolean persist) {
 		this.noise = noise;
+		this.chunksOnly = noise == null;
 		this.clip = clip;
 		this.cache = cache;
-		this.forest = LodConfig.TREES ? new LodForest(noise) : null;
+		this.persist = persist;
+		this.forest = LodConfig.TREES && noise != null ? new LodForest(noise) : null;
 		this.winTx = new int[clip.levels];
 		this.winTz = new int[clip.levels];
 		for (int i = 0; i < LodConfig.THREADS; i++) {
@@ -79,15 +94,31 @@ final class LodField {
 			t.start();
 			this.threads.add(t);
 		}
-		System.out.printf("mcopt-lod: field ready: reach %d chunks, %d levels of %d x %d cells (%.0f MB), switch at %s, %d workers, cache %s%n",
-			LodConfig.RADIUS_CHUNKS, clip.levels, clip.n, clip.n, clip.bytes() / 1048576.0, java.util.Arrays.toString(clip.switchDist), LodConfig.THREADS, cache);
+		System.out.printf("mcopt-lod: field ready: reach %d chunks, %d levels of %d x %d cells (%.0f MB), switch at %s, %d workers, %s, cache %s%s%n",
+			(int) (LodConfig.reachBlocks() / 16), clip.levels, clip.n, clip.n, clip.bytes() / 1048576.0, java.util.Arrays.toString(clip.switchDist), LodConfig.THREADS,
+			noise == null ? "from received chunks only" : "generated", cache, persist ? "" : " (not used)");
 	}
 
-	void close() {
-		this.saveDirty(true);
+	/**
+	 * Stops the workers. save: what real chunks changed goes to the cache first, with the saves still queued; else (Forget)
+	 * nothing is saved, and the workers are waited for (a second or two at most), so none writes into the folder after.
+	 */
+	void close(boolean save) {
+		if (save) this.flush();
 		this.closed = true;
 		for (Thread t : this.threads) t.interrupt();
 		if (this.scanner != null) this.scanner.shutdownNow();
+		if (!save) {
+			long until = System.nanoTime() + 2_000_000_000L;
+			for (Thread t : this.threads) {
+				try {
+					t.join(Math.max(1, (until - System.nanoTime()) / 1_000_000));
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+					return;
+				}
+			}
+		}
 	}
 
 	private void work() {
@@ -135,32 +166,38 @@ final class LodField {
 		int[] rn = cr != null ? new int[LodTile.CELLS] : null;
 		int[] pl = level == 0 && this.clip.plants ? new int[2 * LodTile.CELLS] : null;
 		long start = System.nanoTime();
-		boolean fromDisk = LodConfig.DISK_CACHE && this.load(key, g, c, cr, tw, rn, pl);
-		if (!fromDisk) {
+		boolean fromDisk = this.persist && this.load(key, g, c, cr, tw, rn, pl);
+		LodNoise noise = this.noise;
+		if (!fromDisk && noise == null) {
+			// nothing known here yet: the tile goes in empty (its words all 0) for the chunks the client receives to fill
+			// (a cache file that failed partway may have left words behind)
+			for (int[] a : new int[][] {g, c, cr, tw, rn, pl}) if (a != null) java.util.Arrays.fill(a, 0);
+			this.empty.incrementAndGet();
+		} else if (!fromDisk) {
 			LodTile t = new LodTile(level, tx, tz);
 			LodForest forest = this.forest;
 			boolean exact = level < Math.min(2, LodConfig.TREE_LEVELS) && forest != null && forest.available();
 			t.impostorTrees = !exact;
-			this.noise.generate(t);
+			noise.generate(t);
 			if (exact) {
 				if (level == 0) forest.offer(t);
 				forest.plant(t);
-				this.noise.dressTrees(t);
-				this.noise.dressGround(t);
+				noise.dressTrees(t);
+				noise.dressGround(t);
 			}
 			pack(t, g, c, cr, rn, pl);
 			if (tw != null) System.arraycopy(t.tex, 0, tw, 0, LodTile.CELLS);
 			this.genNanos.addAndGet(System.nanoTime() - start);
 			this.generated.incrementAndGet();
-			if (LodConfig.DISK_CACHE) this.save(key, g, c, cr, tw, rn, pl);
+			if (this.persist) this.save(key, g, c, cr, tw, rn, pl);
 		} else {
 			this.loaded.incrementAndGet();
 		}
 		this.results.add(() -> {
 			this.pending.remove(key);
-			if (this.clip.put(level, tx, tz, g, c, cr, tw, rn, pl) && level == 0) {
+			if (this.clip.put(level, tx, tz, g, c, cr, tw, rn, pl)) {
 				List<LodChunks.Summary> real = this.waiting.remove(key);
-				if (real != null) for (LodChunks.Summary s : real) this.applyChunk(s);
+				if (real != null) for (LodChunks.Summary s : real) this.applyChunk(s, level);
 			}
 			this.arrived(key);
 		});
@@ -317,6 +354,10 @@ final class LodField {
 
 	// ---- the game's own chunks ----
 
+	/**
+	 * Chunks that arrived before the tile they write into, by tile: level 0's (the generator fills coarser levels), and with
+	 * chunksOnly every level's, whose tiles over the chunks' area are all requested (see requestNear).
+	 */
 	private final java.util.HashMap<Long, List<LodChunks.Summary>> waiting = new java.util.HashMap<>();
 	/** Level and tile of every tile real chunks changed since it was saved. */
 	private final java.util.Set<Long> dirtyTiles = new java.util.HashSet<>();
@@ -334,50 +375,159 @@ final class LodField {
 		}));
 	}
 
-	/** Writes a chunk's columns into every resident tile that covers it: level 0 every column, coarser at sample points. */
+	/**
+	 * Writes a chunk's columns into every resident tile that covers it: level 0 column for column, each coarser cell from all
+	 * the columns under it (see putReduced).
+	 */
 	private void applyChunk(LodChunks.Summary s) {
+		for (int level = 0; level < this.clip.levels; level++) this.applyChunk(s, level);
+	}
+
+	private void applyChunk(LodChunks.Summary s, int level) {
 		int bx = s.chunkX() * 16, bz = s.chunkZ() * 16;
-		for (int level = 0; level < this.clip.levels; level++) {
-			int span = this.clip.span(level);
-			int tx = Math.floorDiv(bx, span), tz = Math.floorDiv(bz, span);
-			if (!this.clip.resident(level, tx, tz)) {
-				if (level == 0 && this.clip.inWindow(0, tx, tz)) {
-					List<LodChunks.Summary> list = this.waiting.computeIfAbsent(LodTile.key(0, tx, tz), k -> new ArrayList<>());
-					list.removeIf(o -> o.chunkX() == s.chunkX() && o.chunkZ() == s.chunkZ());
-					list.add(s);
-				}
-				continue;
+		int span = this.clip.span(level);
+		int tx = Math.floorDiv(bx, span), tz = Math.floorDiv(bz, span);
+		if (!this.clip.resident(level, tx, tz)) {
+			if ((level == 0 || this.chunksOnly) && this.clip.inWindow(level, tx, tz)) {
+				List<LodChunks.Summary> list = this.waiting.computeIfAbsent(LodTile.key(level, tx, tz), k -> new ArrayList<>());
+				list.removeIf(o -> o.chunkX() == s.chunkX() && o.chunkZ() == s.chunkZ());
+				list.add(s);
 			}
-			if (level == 0 && LodConfig.VERIFY) this.verify(s);
-			int cell = 1 << level;
-			// cells whose sample point (their corner, as generated) is in the chunk
-			int c0x = Math.ceilDiv(bx, cell), c1x = Math.floorDiv(bx + 15, cell);
-			int c0z = Math.ceilDiv(bz, cell), c1z = Math.floorDiv(bz + 15, cell);
-			for (int cz = c0z; cz <= c1z; cz++) {
-				for (int cx = c0x; cx <= c1x; cx++) {
-					int k = (cz * cell - bz) * 16 + (cx * cell - bx);
-					boolean wet = s.water()[k] != LodTile.DRY && s.water()[k] > s.height()[k];
-					int clear = (s.clear()[k] ? LodClip.GEOM_CLEAR : 0) | LodClip.depthBits(s.depth()[k]);
-					int surface = wet ? s.water()[k] : s.height()[k];
-					if (s.crownLo()[k] > surface) {
-						// leaves over air: a crown floating over the ground under it
-						this.clip.putCell(level, cx, cz, LodClip.crownGeomWord(s.crownHi()[k], s.crownHi()[k] - s.crownLo()[k], false) | clear,
-							LodClip.colorWord(s.top()[k], s.side()[k]), LodClip.crownWord(surface, s.groundColor()[k]), s.tex()[k], s.runs()[k], 0, 0);
-					} else if (level == 0) {
-						int pa = s.plantA()[k];
-						this.clip.putCell(level, cx, cz, LodClip.geomWord(Math.max(surface, s.crownHi()[k]), wet) | clear | (s.fringe()[k] && !wet ? LodClip.GEOM_FRINGE : 0)
-							| ((pa & 1023) != 0 && !wet ? LodClip.plantBits((pa >> 20 & 3) + 1) : 0),
-							LodClip.colorWord(s.top()[k], s.side()[k]), LodClip.belowWord(s.below()[k]), s.tex()[k], 0, pa, s.plantB()[k]);
-					} else {
-						// coarser cells: their walls are mostly below the top block
-						this.clip.putCell(level, cx, cz, LodClip.geomWord(Math.max(surface, s.crownHi()[k]), wet) | clear,
-							LodClip.colorWord(s.top()[k], LodColors.mix(s.side()[k], s.below()[k], 0.6F)), 0, 0, 0, 0, 0);
-					}
-				}
-			}
-			this.clip.refresh(level, tx, tz);
-			this.dirtyTiles.add(LodTile.key(level, tx, tz));
+			return;
 		}
+		if (level == 0 && LodConfig.VERIFY) this.verify(s);
+		int cell = 1 << level;
+		if (level == 0) {
+			for (int k = 0; k < 256; k++) {
+				int cx = bx + (k & 15), cz = bz + (k >> 4);
+				boolean wet = s.water()[k] != LodTile.DRY && s.water()[k] > s.height()[k];
+				int clear = (s.clear()[k] ? LodClip.GEOM_CLEAR : 0) | LodClip.depthBits(s.depth()[k]);
+				int surface = wet ? s.water()[k] : s.height()[k];
+				if (s.crownLo()[k] > surface) {
+					// leaves over air: a crown floating over the ground under it
+					this.clip.putCell(level, cx, cz, LodClip.crownGeomWord(s.crownHi()[k], s.crownHi()[k] - s.crownLo()[k], false) | clear,
+						LodClip.colorWord(s.top()[k], s.side()[k]), LodClip.crownWord(surface, s.groundColor()[k]), s.tex()[k], s.runs()[k], 0, 0);
+				} else {
+					int pa = s.plantA()[k];
+					this.clip.putCell(level, cx, cz, LodClip.geomWord(Math.max(surface, s.crownHi()[k]), wet) | clear | (s.fringe()[k] && !wet ? LodClip.GEOM_FRINGE : 0)
+						| ((pa & 1023) != 0 && !wet ? LodClip.plantBits((pa >> 20 & 3) + 1) : 0),
+						LodClip.colorWord(s.top()[k], s.side()[k]), LodClip.belowWord(s.below()[k]), s.tex()[k], 0, pa, s.plantB()[k]);
+				}
+			}
+		} else if (cell <= 16) {
+			// cells inside the chunk: each from its cell x cell columns
+			for (int z = 0; z < 16; z += cell) {
+				for (int x = 0; x < 16; x += cell) this.putReduced(s, level, (bx + x) >> level, (bz + z) >> level, x, z, cell);
+			}
+		} else {
+			// a cell wider than the chunk: from the four finer cells under it where their tile is here (each of those from
+			// its own chunks), else (that tile not resident) from this chunk alone if it holds the cell's corner
+			int cx = bx >> level, cz = bz >> level;
+			if (!this.putFromFiner(level, cx, cz) && bx == cx << level && bz == cz << level) this.putReduced(s, level, cx, cz, 0, 0, 16);
+		}
+		this.clip.refresh(level, tx, tz);
+		this.dirtyTiles.add(LodTile.key(level, tx, tz));
+	}
+
+	// (render thread only)
+	private final int[] redTop = new int[256], redSort = new int[256];
+
+	/**
+	 * A summary column's top for a coarser cell: its ground, water or tree crown, whichever is highest. A build floating over
+	 * open space counts as the ground under it: a coarser cell has no crown word, so it would stand on the ground as a pillar.
+	 */
+	private static int columnTop(LodChunks.Summary s, int k) {
+		boolean wet = s.water()[k] != LodTile.DRY && s.water()[k] > s.height()[k];
+		int surface = wet ? s.water()[k] : s.height()[k];
+		return s.build()[k] ? surface : Math.max(surface, s.crownHi()[k]);
+	}
+
+	/**
+	 * One coarser cell from the summary's size x size columns at (x0, z0) in the chunk. Its height is the one at least half of
+	 * them reach (the upper median), so a lamp post, a spire or a tower's corner doesn't stand for the whole cell, as the
+	 * column at the cell's corner used to: a build shows at a level where it covers half a cell. Its colors are the mean of
+	 * the columns at about that height (and as wet), its other bits those of the first column at it.
+	 */
+	private void putReduced(LodChunks.Summary s, int level, int cx, int cz, int x0, int z0, int size) {
+		int n = size * size;
+		for (int z = 0, k = 0; z < size; z++) {
+			for (int x = 0; x < size; x++, k++) this.redTop[k] = columnTop(s, (z0 + z) * 16 + x0 + x);
+		}
+		System.arraycopy(this.redTop, 0, this.redSort, 0, n);
+		java.util.Arrays.sort(this.redSort, 0, n);
+		int h = this.redSort[n / 2];
+		int rep = -1;
+		for (int k = 0; k < n && rep < 0; k++) if (this.redTop[k] == h) rep = (z0 + k / size) * 16 + x0 + k % size;
+		boolean wet = s.water()[rep] != LodTile.DRY && s.water()[rep] > s.height()[rep];
+		int surface = wet ? s.water()[rep] : s.height()[rep];
+		int clear = (s.clear()[rep] ? LodClip.GEOM_CLEAR : 0) | LodClip.depthBits(s.depth()[rep]);
+		if (level < this.clip.crownLevels && s.crownLo()[rep] > surface && !s.build()[rep]) {
+			// (-Dmcopt.lod.crownLevels over 1) a crown cell: the column's own
+			this.clip.putCell(level, cx, cz, LodClip.crownGeomWord(s.crownHi()[rep], s.crownHi()[rep] - s.crownLo()[rep], false) | clear,
+				LodClip.colorWord(s.top()[rep], s.side()[rep]), LodClip.crownWord(surface, s.groundColor()[rep]), 0, s.runs()[rep], 0, 0);
+			return;
+		}
+		long tr = 0, tg = 0, tb = 0, sr = 0, sg = 0, sb = 0;
+		int m = 0;
+		for (int k = 0; k < n; k++) {
+			if (Math.abs(this.redTop[k] - h) > 1) continue;
+			int i = (z0 + k / size) * 16 + x0 + k % size;
+			if ((s.water()[i] != LodTile.DRY && s.water()[i] > s.height()[i]) != wet) continue;
+			// (coarser cells: their walls are mostly below the top block; a floating build's column: its ground's)
+			int t = s.build()[i] ? s.groundColor()[i] : s.top()[i];
+			int d = LodColors.mix(s.build()[i] ? t : s.side()[i], s.below()[i], 0.6F);
+			tr += t >> 16 & 255;
+			tg += t >> 8 & 255;
+			tb += t & 255;
+			sr += d >> 16 & 255;
+			sg += d >> 8 & 255;
+			sb += d & 255;
+			m++;
+		}
+		int top = (int) (tr / m) << 16 | (int) (tg / m) << 8 | (int) (tb / m), side = (int) (sr / m) << 16 | (int) (sg / m) << 8 | (int) (sb / m);
+		this.clip.putCell(level, cx, cz, LodClip.geomWord(h, wet) | clear, LodClip.colorWord(top, side), 0, 0, 0, 0, 0);
+	}
+
+	/**
+	 * A cell from the four cells under it on the next finer level, as putReduced does from columns: the upper median of the
+	 * ones with data (at least two of them, else the cell is left as it is). False when their tile isn't resident.
+	 */
+	private boolean putFromFiner(int level, int cx, int cz) {
+		int f = level - 1;
+		if (!this.clip.resident(f, Math.floorDiv(cx * 2, LodClip.TILE), Math.floorDiv(cz * 2, LodClip.TILE))) return false;
+		int[] g = new int[4], c = new int[4], y = new int[4];
+		int n = 0;
+		for (int q = 0; q < 4; q++) {
+			int gw = this.clip.cellGeom(f, cx * 2 + (q & 1), cz * 2 + (q >> 1));
+			if ((gw & LodClip.GEOM_VALID) == 0) continue;
+			g[n] = gw;
+			c[n] = this.clip.cellColor(f, cx * 2 + (q & 1), cz * 2 + (q >> 1));
+			y[n] = (gw & 0xFFF) - 512;
+			n++;
+		}
+		if (n < 2) return true;
+		int[] sorted = java.util.Arrays.copyOf(y, n);
+		java.util.Arrays.sort(sorted);
+		int h = sorted[n / 2], rep = 0;
+		while (y[rep] != h) rep++;
+		boolean wet = (g[rep] & LodClip.GEOM_WET) != 0;
+		int[] sum = new int[6];
+		int m = 0;
+		for (int k = 0; k < n; k++) {
+			if (Math.abs(y[k] - h) > 1 || ((g[k] & LodClip.GEOM_WET) != 0) != wet) continue;
+			for (int half = 0; half < 2; half++) {
+				int w = c[k] >>> (16 * half) & 0xFFFF;
+				sum[half * 3] += w >> 11;
+				sum[half * 3 + 1] += w >> 5 & 63;
+				sum[half * 3 + 2] += w & 31;
+			}
+			m++;
+		}
+		int color = 0;
+		for (int half = 0; half < 2; half++) color |= ((sum[half * 3] / m) << 11 | (sum[half * 3 + 1] / m) << 5 | sum[half * 3 + 2] / m) << (16 * half);
+		int keep = LodClip.GEOM_CLEAR | 127 << LodClip.GEOM_DEPTH_SHIFT;
+		this.clip.putCell(level, cx, cz, LodClip.geomWord(h, wet) | (g[rep] & keep), color, 0, 0, 0, 0, 0);
+		return true;
 	}
 
 	// ---- -Dmcopt.lod.verify: generated far terrain against the real chunks, column by column ----
@@ -510,22 +660,82 @@ final class LodField {
 		return java.util.Arrays.equals(ua, ub);
 	}
 
-	/** Every few seconds: tiles real chunks changed go back to the disk cache (read back from the clipmap, saved on a worker). */
+	private long lastSave = System.nanoTime();
+
+	/**
+	 * Every few seconds: tiles real chunks changed go back to the disk cache (read back from the clipmap, saved on a worker).
+	 * By time, not frames: without a generator the cache is the only copy of what the player has seen, and a disconnect
+	 * shouldn't take more than a few seconds of it.
+	 */
 	void saveDirty(boolean all) {
-		if (!LodConfig.DISK_CACHE || this.dirtyTiles.isEmpty() || !all && this.frame % 3000 != 0) return;
+		if (!this.persist) this.dirtyTiles.clear();
+		if (this.dirtyTiles.isEmpty()) return;
+		long now = System.nanoTime();
+		if (!all && now - this.lastSave < 5_000_000_000L) return;
+		this.lastSave = now;
 		for (long key : this.dirtyTiles) {
-			int level = LodTile.levelOf(key), tx = LodTile.txOf(key), tz = LodTile.tzOf(key);
-			if (!this.clip.resident(level, tx, tz)) continue;
-			int[] g = new int[LodTile.CELLS], c = new int[LodTile.CELLS];
-			int[] cr = level < this.clip.crownLevels ? new int[LodTile.CELLS] : null;
-			int[] tw = level == 0 && LodConfig.TEXTURES ? new int[LodTile.CELLS] : null;
-			int[] rn = cr != null ? new int[LodTile.CELLS] : null;
-			int[] pl = level == 0 && this.clip.plants ? new int[2 * LodTile.CELLS] : null;
-			this.clip.read(level, tx, tz, g, c, cr, tw, rn, pl);
-			if (all) this.save(key, g, c, cr, tw, rn, pl);
-			else this.jobs.add(new Job(0, this.seq.incrementAndGet(), 0, () -> this.save(key, g, c, cr, tw, rn, pl)));
+			if (this.clip.resident(LodTile.levelOf(key), LodTile.txOf(key), LodTile.tzOf(key))) this.saveTile(key, all);
 		}
 		this.dirtyTiles.clear();
+	}
+
+	/** Everything real chunks changed to the cache now: the dirty tiles, and the saves still queued for the workers. */
+	void flush() {
+		this.saveDirty(true);
+		Runnable r;
+		while ((r = this.saves.poll()) != null) r.run();
+	}
+
+	/** A resident tile's words, read back from the clipmap, to the disk cache: now, or on a worker. */
+	private void saveTile(long key, boolean now) {
+		int level = LodTile.levelOf(key), tx = LodTile.txOf(key), tz = LodTile.tzOf(key);
+		int[] g = new int[LodTile.CELLS], c = new int[LodTile.CELLS];
+		int[] cr = level < this.clip.crownLevels ? new int[LodTile.CELLS] : null;
+		int[] tw = level == 0 && LodConfig.TEXTURES ? new int[LodTile.CELLS] : null;
+		int[] rn = cr != null ? new int[LodTile.CELLS] : null;
+		int[] pl = level == 0 && this.clip.plants ? new int[2 * LodTile.CELLS] : null;
+		this.clip.read(level, tx, tz, g, c, cr, tw, rn, pl);
+		if (now) {
+			this.save(key, g, c, cr, tw, rn, pl);
+			return;
+		}
+		// (queued saves are also kept here, for close to run the ones no worker got to)
+		Runnable r = () -> this.save(key, g, c, cr, tw, rn, pl);
+		this.saves.add(r);
+		this.jobs.add(new Job(0, this.seq.incrementAndGet(), 0, () -> {
+			if (this.saves.remove(r)) r.run();
+		}));
+	}
+
+	/**
+	 * Before the windows move to (cx, cz): dirty tiles they would leave go to the cache now (clearing a slot drops its words,
+	 * and without a generator the cache is the only other copy). Chunks waiting for a tile that left are dropped after.
+	 */
+	private void saveLeaving(double cx, double cz) {
+		if (!this.persist || this.dirtyTiles.isEmpty()) return;
+		int h = this.clip.tilesPerSide / 2;
+		var it = this.dirtyTiles.iterator();
+		while (it.hasNext()) {
+			long key = it.next();
+			int level = LodTile.levelOf(key), tx = LodTile.txOf(key), tz = LodTile.tzOf(key), span = this.clip.span(level);
+			int x = tx - (Math.floorDiv((int) Math.floor(cx), span) - h), z = tz - (Math.floorDiv((int) Math.floor(cz), span) - h);
+			if (x >= 0 && z >= 0 && x < this.clip.tilesPerSide && z < this.clip.tilesPerSide) continue;
+			it.remove();
+			if (this.clip.resident(level, tx, tz)) this.saveTile(key, false);
+		}
+	}
+
+	private void dropWaitingOutside() {
+		if (!this.waiting.isEmpty()) this.waiting.keySet().removeIf(k -> !this.clip.inWindow(LodTile.levelOf(k), LodTile.txOf(k), LodTile.tzOf(k)));
+	}
+
+	/**
+	 * Without a generator, every level keeps its tiles over the chunks the client has (within the render distance and a
+	 * little), though the finer level draws there: so the chunks reach each level's tiles and its cache, for when that level
+	 * draws this area from afar. A tile nearer than this to the camera is requested at every level.
+	 */
+	private boolean requestNear(double near) {
+		return this.chunksOnly && near < this.rdBlocks + 64;
 	}
 
 	// ---- render thread ----
@@ -549,7 +759,9 @@ final class LodField {
 	 * moved a few blocks or tiles arrived.
 	 */
 	void update(double cx, double cz, FrustumIntersection frustum, double camY) {
+		this.saveLeaving(cx, cz);
 		boolean moved = this.clip.recenter(cx, cz);
+		if (moved) this.dropWaitingOutside();
 		for (int l = 0; l < this.clip.levels; l++) {
 			this.winTx[l] = this.clip.winTx[l];
 			this.winTz[l] = this.clip.winTz[l];
@@ -574,9 +786,9 @@ final class LodField {
 					double dx = Math.max(0, Math.max(x0 - cx, cx - (x0 + span))), dz = Math.max(0, Math.max(z0 - cz, cz - (z0 + span)));
 					double near = Math.sqrt(dx * dx + dz * dz);
 					if (near > outer) continue;
-					// entirely inside the inner radius: the finer level covers it
+					// entirely inside the inner radius: the finer level covers it (but see requestNear)
 					double fx = Math.max(Math.abs(x0 - cx), Math.abs(x0 + span - cx)), fz = Math.max(Math.abs(z0 - cz), Math.abs(z0 + span - cz));
-					if (Math.sqrt(fx * fx + fz * fz) < inner) continue;
+					if (Math.sqrt(fx * fx + fz * fz) < inner && !this.requestNear(near)) continue;
 					needed++;
 					if (this.clip.resident(l, tx, tz)) continue;
 					missing++;
@@ -645,7 +857,9 @@ final class LodField {
 		this.lastX = cx;
 		this.lastZ = cz;
 		this.lastT = now;
+		this.saveLeaving(cx, cz);
 		boolean moved = this.clip.recenter(cx, cz);
+		if (moved) this.dropWaitingOutside();
 		for (int l = 0; l < this.clip.levels; l++) {
 			this.winTx[l] = this.clip.winTx[l];
 			this.winTz[l] = this.clip.winTz[l];
@@ -713,7 +927,7 @@ final class LodField {
 					double near = Math.sqrt(dx * dx + dz * dz);
 					if (near > outer) continue;
 					double fx = Math.max(Math.abs(x0 - cx), Math.abs(x0 + span - cx)), fz = Math.max(Math.abs(z0 - cz), Math.abs(z0 + span - cz));
-					if (Math.sqrt(fx * fx + fz * fz) < inner) continue;
+					if (Math.sqrt(fx * fx + fz * fz) < inner && !this.requestNear(near)) continue;
 					needed++;
 					if (this.clip.resident(l, tx, tz)) continue;
 					missing++;

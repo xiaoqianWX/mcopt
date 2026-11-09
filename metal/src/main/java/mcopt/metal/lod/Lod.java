@@ -5,6 +5,7 @@ import com.mojang.renderpearl.frontend.FrontendCommandEncoder;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import mcopt.metal.MetalBridge;
 import mcopt.metal.MetalHooks;
@@ -68,6 +69,8 @@ public final class Lod {
 	/** The mesh's position-keyed lists (-Dmcopt.lod.pk), else null. */
 	private @Nullable LodPk pk;
 	private @Nullable Object worldOwner;
+	/** FarTerrain.generation() the far terrain was built for: a settings change rebuilds it. */
+	private int builtGen = mcopt.metal.FarTerrain.generation();
 	/** -Dmcopt.lod.seam=DIR: the transition probe (LodSeam), else null. */
 	private final @Nullable LodSeam seam;
 	/** -Dmcopt.lod.taa: the far terrain's temporal filter (LodTaa), else null. */
@@ -80,6 +83,16 @@ public final class Lod {
 	private final int[] seamMaskPrev = new int[MASK_MAX * MASK_MAX / 32];
 	/** The reach the camera and fog hooks extend to while a world draws far terrain (0: none). */
 	private static volatile float activeReach;
+	/**
+	 * Where the fog ends while far terrain draws (0: none): the reach, or without a generator (LodField.chunksOnly) as far as
+	 * the far terrain has data in view (coverage), so the edge of what the player has explored never shows against the sky.
+	 * At or inside the render distance the fog is the game's own.
+	 */
+	private static volatile float fogReach;
+	/** chunksOnly: the fog's reach, eased toward the coverage scan's (0: not started in this world). */
+	private double cover;
+	private double coverTarget;
+	private long coverNanos, coverScanNanos;
 
 	// this frame
 	private double camX, camY, camZ;
@@ -157,9 +170,14 @@ public final class Lod {
 		}
 	}
 
-	/** Reach in blocks while far terrain draws in the current level, else 0 (the camera's far plane and the fog follow it). */
+	/** Reach in blocks while far terrain draws in the current level, else 0 (the camera's far plane follows it). */
 	public static float activeReach() {
 		return activeReach;
+	}
+
+	/** Where the fog ends while far terrain draws, else 0 (see fogReach). */
+	public static float fogReach() {
+		return fogReach;
 	}
 
 	/**
@@ -168,14 +186,15 @@ public final class Lod {
 	 * terrain fades into the game's own fog color at its edge as the real terrain did at the render distance.
 	 */
 	public static void adjustFog(FogData fog, FogType type) {
-		float reach = activeReach;
-		if (reach <= 0 || type != FogType.ATMOSPHERIC) return;
+		float reach = fogReach;
+		// (not past the game's own: then its fog stays as it is)
+		if (reach <= 0 || type != FogType.ATMOSPHERIC || reach <= fog.renderDistanceEnd) return;
 		// as the game sets it for a render distance of the reach: a fade over its last tenth (4..64 blocks)
 		fog.renderDistanceStart = LodConfig.FOG_START >= 0 ? (float) (reach * LodConfig.FOG_START) : reach - Math.clamp(reach / 10.0F, 4.0F, 64.0F);
 		fog.renderDistanceEnd = reach;
 		if (fog.environmentalEnd >= 512) {
 			// the haze stretched with the reach (unchanged up to 1024 / haze blocks, so a short reach looks exactly like the game)
-			float scale = Math.max(1.0F, (float) (LodConfig.HAZE * reach) / 1024.0F);
+			float scale = Math.max(1.0F, (float) (mcopt.metal.FarTerrain.hazeFactor() * reach) / 1024.0F);
 			fog.environmentalStart *= scale;
 			fog.environmentalEnd *= scale;
 		}
@@ -199,6 +218,7 @@ public final class Lod {
 			failed = true;
 			instance = null;
 			activeReach = 0;
+			fogReach = 0;
 			System.out.println("mcopt-lod: far terrain stopped: " + e);
 			e.printStackTrace(System.out);
 		}
@@ -296,11 +316,13 @@ public final class Lod {
 		this.ensureWorld(mc);
 		if (this.field == null) {
 			activeReach = 0;
+			fogReach = 0;
 			shadeReach(0);
 			return;
 		}
 		activeReach = (float) LodConfig.reachBlocks();
-		shadeReach(activeReach);
+		fogReach = this.field.chunksOnly ? this.easeCover(mc) : activeReach;
+		shadeReach(fogReach);
 		this.camX = camera.pos.x;
 		this.camY = camera.pos.y;
 		this.camZ = camera.pos.z;
@@ -326,13 +348,20 @@ public final class Lod {
 		}
 	}
 
+	/**
+	 * Builds the far terrain for the level the client is in, when that changes or a setting it's built for does (distance,
+	 * detail, servers). The Forget button drops the current one unsaved and its cache folder with it, and starts over.
+	 */
 	private void ensureWorld(Minecraft mc) {
 		ClientLevel level = mc.level;
-		MinecraftServer server = mc.getSingleplayerServer();
-		Object owner = level == null || server == null ? null : level;
-		if (owner == this.worldOwner) return;
+		Object owner = level;
+		boolean forget = owner != null && owner == this.worldOwner && mcopt.metal.FarTerrain.takeForget();
+		if (owner == this.worldOwner && this.builtGen == mcopt.metal.FarTerrain.generation() && !forget) return;
+		this.builtGen = mcopt.metal.FarTerrain.generation();
+		// (the world's or server's folder: every dimension of it, though this one may draw none)
+		@Nullable Path forgotten = forget ? cacheDir(mc, level).getParent() : null;
 		if (this.field != null) {
-			this.field.close();
+			this.field.close(!forget);
 			this.field = null;
 		}
 		if (this.mesh != null) {
@@ -349,21 +378,30 @@ public final class Lod {
 			this.releaseLater.add(new long[] {this.frames, this.clip.colorBuf});
 			this.releaseLater.add(new long[] {this.frames, this.clip.mipBuf});
 			this.releaseLater.add(new long[] {this.frames, this.clip.crownBuf});
+			this.releaseLater.add(new long[] {this.frames, this.clip.texBuf});
 			this.clip = null;
 		}
+		if (forgotten != null) forgetCache(forgotten);
 		this.worldOwner = owner;
+		this.cover = 0;
+		this.coverTarget = 0;
 		if (owner == null) return;
-		ServerLevel sl = server.getLevel(level.dimension());
-		if (sl == null) return;
-		LodNoise noise = LodNoise.of(sl);
-		if (noise == null) {
-			System.out.println("mcopt-lod: no far terrain in " + level.dimension().identifier() + " (not noise-generated, or a ceiling)");
+		if (level.dimensionType().hasCeiling()) {
+			System.out.println("mcopt-lod: no far terrain in " + level.dimension().identifier() + " (a ceiling)");
 			return;
 		}
-		Path root = LodConfig.CACHE_DIR != null ? Path.of(LodConfig.CACHE_DIR) : mc.gameDirectory.toPath().resolve("mcopt-lod");
-		String save = server.getWorldPath(LevelResource.ROOT).toAbsolutePath().normalize().getFileName().toString();
-		Path cache = root.resolve(save).resolve(level.dimension().identifier().getNamespace() + "_" + level.dimension().identifier().getPath());
-		this.clip = new LodClip(this.ctx, LodConfig.N, LodConfig.reachBlocks());
+		// singleplayer: generated from the world's own noise where it can be; else (a server's world, or one that isn't
+		// noise-generated) from the chunks the client receives only
+		MinecraftServer server = mc.getSingleplayerServer();
+		if (server == null && mcopt.metal.FarTerrain.servers() == mcopt.metal.FarTerrain.Servers.OFF) {
+			System.out.println("mcopt-lod: no far terrain on servers (the Far terrain on servers setting)");
+			return;
+		}
+		ServerLevel sl = server == null ? null : server.getLevel(level.dimension());
+		LodNoise noise = sl == null ? null : LodNoise.of(sl);
+		Path cache = cacheDir(mc, level);
+		LodConfig.reach = mcopt.metal.FarTerrain.distanceChunks() * 16.0;
+		this.clip = new LodClip(this.ctx, mcopt.metal.FarTerrain.n(), LodConfig.reach);
 		if (LodConfig.MESH) this.mesh = new LodMesh(this.ctx, this.clip);
 		if (this.mesh != null && LodPk.ENABLED) {
 			// (its passes order their outputs by hazard tracking, not -Dmcopt.lod.meshFences' fences)
@@ -376,9 +414,117 @@ public final class Lod {
 			if (this.publish == null) this.publish = new LodPublish(this.ctx);
 			this.clip.publisher = this.publish;
 		}
-		this.field = new LodField(noise, this.clip, cache);
-		if (LodGenBench.ENABLED) LodGenBench.start(noise, this.field);
+		// (Session on servers: nothing read from or written to the cache)
+		boolean persist = LodConfig.DISK_CACHE && (server != null || mcopt.metal.FarTerrain.servers() == mcopt.metal.FarTerrain.Servers.SAVED);
+		this.field = new LodField(noise, this.clip, cache, persist);
+		if (LodGenBench.ENABLED && noise != null) LodGenBench.start(noise, this.field);
 		if (LodYield.ON) LodYield.top = this.clip.levels - 1;
+		if (noise == null) this.captureLoaded(mc, level);
+	}
+
+	/** The level's cache folder: mcopt-lod/<save>/<dimension> in singleplayer, mcopt-lod/servers/<address>/<dimension> else. */
+	private static Path cacheDir(Minecraft mc, ClientLevel level) {
+		Path root = LodConfig.CACHE_DIR != null ? Path.of(LodConfig.CACHE_DIR) : mc.gameDirectory.toPath().resolve("mcopt-lod");
+		String dim = level.dimension().identifier().getNamespace() + "_" + level.dimension().identifier().getPath();
+		MinecraftServer server = mc.getSingleplayerServer();
+		if (server == null) return root.resolve("servers").resolve(serverKey(mc)).resolve(dim);
+		String save = server.getWorldPath(LevelResource.ROOT).toAbsolutePath().normalize().getFileName().toString();
+		return root.resolve(save).resolve(dim);
+	}
+
+	/**
+	 * Forget: the folder is renamed out of the way at once (the new far terrain starts from nothing) and deleted on a thread
+	 * of its own, once the old far terrain's workers are done with it.
+	 */
+	private static void forgetCache(Path dir) {
+		if (!Files.isDirectory(dir)) return;
+		Path gone = dir.resolveSibling(dir.getFileName() + ".forgotten-" + System.nanoTime());
+		try {
+			Files.move(dir, gone, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+		} catch (IOException e) {
+			System.out.println("mcopt-lod: can't forget " + dir + ": " + e);
+			return;
+		}
+		System.out.println("mcopt-lod: forgot " + dir);
+		Thread t = new Thread(() -> {
+			try (var walk = Files.walk(gone)) {
+				for (Path f : (Iterable<Path>) walk.sorted(java.util.Comparator.reverseOrder())::iterator) Files.deleteIfExists(f);
+			} catch (IOException e) {
+				System.out.println("mcopt-lod: can't delete " + gone + ": " + e);
+			}
+		}, "mcopt-lod-forget");
+		t.setDaemon(true);
+		t.start();
+	}
+
+	/**
+	 * The cache folder of a server's worlds: its address as the player typed it (the default port left out), in characters
+	 * any file system takes. One server, one far terrain per dimension: a server that swaps its map keeps showing the old
+	 * one until the new one's chunks have been around.
+	 */
+	private static String serverKey(Minecraft mc) {
+		var data = mc.getCurrentServer();
+		String ip = data == null || data.ip == null || data.ip.isBlank() ? "unknown" : data.ip.trim().toLowerCase(java.util.Locale.ROOT);
+		if (ip.endsWith(":25565")) ip = ip.substring(0, ip.length() - ":25565".length());
+		return ip.replaceAll("[^a-z0-9._-]", "_");
+	}
+
+	/**
+	 * Chunks the client already has when the field starts (on joining, the first ones arrive before the first frame draws):
+	 * without a generator nothing else would put them in the far terrain until they unload.
+	 */
+	private void captureLoaded(Minecraft mc, ClientLevel level) {
+		var camera = mc.getCameraEntity();
+		if (camera == null || this.field == null || !LodConfig.CHUNKS) return;
+		int r = mc.options.getEffectiveRenderDistance() + 2;
+		int cx = camera.chunkPosition().x(), cz = camera.chunkPosition().z();
+		for (int z = cz - r; z <= cz + r; z++) {
+			for (int x = cx - r; x <= cx + r; x++) {
+				LevelChunk c = level.getChunkSource().getChunk(x, z, false);
+				if (c != null) this.field.chunk(c);
+			}
+		}
+	}
+
+	/** chunksOnly: this frame's fog reach, eased toward the last coverage scan's: in quickly (no edge may show), out slowly. */
+	private float easeCover(Minecraft mc) {
+		double rd = mc.options.getEffectiveRenderDistance() * 16.0;
+		double target = Math.max(rd, this.coverTarget);
+		long now = System.nanoTime();
+		if (this.cover <= 0) {
+			this.cover = rd;
+			this.coverNanos = now;
+		}
+		double dt = Math.min(1.0, (now - this.coverNanos) / 1e9);
+		this.coverNanos = now;
+		this.cover += (target - this.cover) * (1 - Math.exp(-dt / (target < this.cover ? 0.1 : 1.0)));
+		return (float) this.cover;
+	}
+
+	/**
+	 * chunksOnly: how far the far terrain has data in the directions in view: along rays over the ground from the real
+	 * terrain's edge (from) out, the nearest point where the walk would find nothing. Within 75 degrees of the view's
+	 * heading (every heading when looking nearly straight up or down). A hole narrower than a step can slip through.
+	 */
+	private double coverage(LodClip clip, double from) {
+		double min = LodConfig.reachBlocks();
+		double len = Math.hypot(this.forward.x, this.forward.z);
+		boolean all = len < 0.25;
+		double heading = Math.atan2(this.forward.z, this.forward.x);
+		int rays = all ? 96 : 41;
+		for (int i = 0; i < rays && min > from; i++) {
+			double a = all ? i * (2 * Math.PI / rays) : heading + Math.toRadians(-75 + 150.0 * i / (rays - 1));
+			double dx = Math.cos(a), dz = Math.sin(a);
+			double r = from;
+			while (r < min) {
+				int level = 0;
+				while (level < clip.levels - 1 && r >= clip.switchDist[level]) level++;
+				if (!clip.covered(level, (int) Math.floor(this.camX + dx * r), (int) Math.floor(this.camZ + dz * r))) break;
+				r += Math.max(16, 4 << level);
+			}
+			min = Math.min(min, r);
+		}
+		return min;
 	}
 
 	private void draw() {
@@ -399,6 +545,10 @@ public final class Lod {
 		if (LodField.PRIO_SCREEN) w.updateScreen(this.camX, this.camZ, this.frustum, this.camY, this.viewProj, this.forward, this::maskSnapshot);
 		else w.update(this.camX, this.camZ, this.frustum, this.camY);
 		w.saveDirty(false);
+		if (w.chunksOnly && start - this.coverScanNanos > 100_000_000L) {
+			this.coverScanNanos = start;
+			this.coverTarget = this.coverage(clip, mc.options.getEffectiveRenderDistance() * 16.0);
+		}
 		long t2 = System.nanoTime();
 		this.partNanos[1] += t2 - t1;
 		int rd = mc.options.getEffectiveRenderDistance();
@@ -719,7 +869,8 @@ public final class Lod {
 		MemoryUtil.memPutFloat(f + 48, (float) (this.camX - bx));
 		MemoryUtil.memPutFloat(f + 52, (float) this.camY);
 		MemoryUtil.memPutFloat(f + 56, (float) (this.camZ - bz));
-		MemoryUtil.memPutFloat(f + 60, (float) LodConfig.reachBlocks());
+		// (without a generator nothing shows past the fog, which stops where the data does: the walk stops there too)
+		MemoryUtil.memPutFloat(f + 60, (float) (fogReach > 0 ? Math.min(LodConfig.reachBlocks(), fogReach + 64) : LodConfig.reachBlocks()));
 		MemoryUtil.memPutInt(f + 64, bx);
 		MemoryUtil.memPutInt(f + 68, by);
 		MemoryUtil.memPutInt(f + 72, bz);
@@ -1173,7 +1324,8 @@ public final class Lod {
 			w.generated.get() == 0 ? 0 : w.genNanos.get() / 1e6 / w.generated.get(), w.loaded.get(), w.pendingJobs(), w.queued(), w.chunksSummarized.get(),
 			this.nearestFar, w.settled ? String.format("%.1fs", (w.settledNanos - w.startNanos) / 1e9) : "no");
 		StringBuilder gen = new StringBuilder();
-		for (int i = 0; i < 16; i++) {
+		if (w.chunksOnly) System.out.printf("mcopt-lod stats: from received chunks only: %d tiles started empty, fog at %.0f blocks%n", w.empty.get(), fogReach);
+		for (int i = 0; i < 16 && w.noise != null; i++) {
 			long n = w.noise.stageNanos.get(i * 4 + 3);
 			if (n == 0) continue;
 			gen.append(String.format(" L%d:%d tiles %.0f/%.0f/%.0f ms", i, n, w.noise.stageNanos.get(i * 4) / 1e6 / n, w.noise.stageNanos.get(i * 4 + 1) / 1e6 / n,
@@ -1242,6 +1394,12 @@ public final class Lod {
 	 */
 	private final it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap edited = new it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap();
 	private static final long EDIT_QUIET_NS = 150_000_000L;
+
+	/** Render thread: the client is leaving its world (Minecraft.disconnect): what real chunks changed goes to the cache now. */
+	public static void leftWorld() {
+		Lod l = instance;
+		if (l != null && l.field != null) l.field.flush();
+	}
 
 	/** -Dmcopt.lod.editLog=N: log the first N block changes the real terrain's occluders follow (what changes blocks). */
 	private static int editLog = Integer.getInteger("mcopt.lod.editLog", 0);
@@ -1321,7 +1479,7 @@ public final class Lod {
 		Lod l = instance;
 		if (l == null || l.field == null || l.clip == null) return m;
 		LodField w = l.field;
-		m.put("reachChunks", LodConfig.RADIUS_CHUNKS);
+		m.put("reachChunks", (int) (LodConfig.reachBlocks() / 16));
 		m.put("n", l.clip.n);
 		m.put("levels", l.clip.levels);
 		m.put("clipMb", l.clip.bytes() / 1048576.0);
